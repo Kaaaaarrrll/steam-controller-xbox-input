@@ -277,6 +277,18 @@ result over the installed binary, keeping the original as `SteamlessController.e
 
 ---
 
+## Audio haptics
+
+The same application can also **stream system audio to the controller's trackpad actuators as
+PCM and replace game rumble with it** - an EQ, a speaker-sync delay, and an option to gate the
+haptics on the game's own rumble calls so the game supplies the timing and the audio supplies
+the texture.
+
+That work, the HID protocol it uses, and two hardware findings that are not documented
+anywhere else - only one of five vendor interfaces drives the actuators, and a write costs
+4000 us because it waits for the radio slot - are in
+[`steamlesscontroller-patches/audio-haptics/`](steamlesscontroller-patches/audio-haptics/).
+
 ## Troubleshooting
 
 | Symptom | Fix |
