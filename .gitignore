@@ -1,0 +1,10 @@
+# Build output
+build/
+*.obj
+*.pdb
+*.exe
+
+# Local logs and state
+logs/
+*.log
+config.json
