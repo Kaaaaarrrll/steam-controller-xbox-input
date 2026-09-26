@@ -31,6 +31,10 @@ These changes are derivative works of SteamlessController and remain under **its
 
 ## Apply and build
 
+**Easier:** the same change is already applied on the `patched-1.17` branch of the fork,
+[github.com/Kaaaaarrrll/SteamlessController](https://github.com/Kaaaaarrrll/SteamlessController)
+— clone it and skip straight to the two `cmake` lines. To apply the patch yourself:
+
 ```
 git clone https://github.com/ddeverill/SteamlessController
 cd SteamlessController

@@ -2,8 +2,8 @@
     SteamPadWatchdog.ps1
     ---------------------------------------------------------------------------
     Keeps a Steam Controller (2026) usable as an Xbox pad inside the Windows 11
-    Xbox full screen experience, and hands the controller over to Steam Input
-    while a Steam game is running.
+    Xbox full screen experience, and gets out of Steam's way whenever Steam is
+    running.
 
     Why this exists:
       * The 2026 Steam Controller has no XInput mode. The Xbox app only speaks
@@ -15,17 +15,15 @@
         This watchdog enforces that, and flips between them automatically.
 
     State machine (polled twice a second):
-        No Steam game running  ->  bridge should be running
-        Steam game running     ->  bridge stops (Steam Input owns the pad)
+        Steam not running  ->  bridge running
+        Steam running      ->  bridge stopped - game or no game
 
-    Steam merely being OPEN is not a reason to stop. That is the "finished a
-    game, back in the Xbox app" case, and the bridge is the only thing making
-    the pad work there. Matches the app's own "Auto - Off ONLY while in Steam
-    game" mode, which this used to override by killing the process under it.
+    Steam merely being open is enough to stop the bridge. Tested on hardware:
+    with Steam open and the bridge also active, every press reached both apps.
 
-    It never closes Steam. It used to, once Steam had been in the background
-    for a while, and that reads from the outside as Steam quitting itself at
-    random. Starting and stopping Steam is the user's business.
+    It never closes Steam - the user does that to get the pad back. It used to
+    close Steam itself once it had sat in the background a while, and from the
+    outside that looked like Steam quitting at random.
 
     Runs unattended from a logon scheduled task. Logs to
     %LOCALAPPDATA%\SteamPadBridge\logs\watchdog.log
@@ -234,28 +232,6 @@ function Test-XboxPadVisible {
     } catch { return $false }
 }
 
-$script:LastGameProbe  = [datetime]::MinValue
-$script:LastGameResult = $false
-
-function Test-SteamGameRunning {
-    # Primary signal: Steam writes the running app id here (0 = no game).
-    try {
-        $v = Get-ItemProperty -Path 'HKCU:\Software\Valve\Steam' -Name 'RunningAppID' -ErrorAction SilentlyContinue
-        if ($v -and $v.RunningAppID -and [int]$v.RunningAppID -ne 0) { return $true }
-    } catch { }
-
-    # Backup signal (RunningAppID is unreliable for a handful of titles):
-    # any process executing out of a steamapps\common folder. Throttled - WMI is
-    # not something to run twice a second.
-    if (((Get-Date) - $script:LastGameProbe).TotalSeconds -lt 3) { return $script:LastGameResult }
-    $script:LastGameProbe = Get-Date
-    try {
-        $hit = Get-CimInstance Win32_Process -Filter "ExecutablePath LIKE '%\\steamapps\\common\\%'" -ErrorAction SilentlyContinue |
-               Select-Object -First 1
-        $script:LastGameResult = [bool]$hit
-    } catch { $script:LastGameResult = $false }
-    return $script:LastGameResult
-}
 
 function Stop-Bridge {
     $p = Get-BridgeProcess
@@ -315,7 +291,6 @@ if ($SelfTest) {
         BridgeRunning     = [bool]$bridge
         SteamExe          = $Config.SteamExe
         SteamRunning      = [bool]$steam
-        SteamGameRunning  = (Test-SteamGameRunning)
         ControllerPresent = (Test-ControllerPresent -Force)
         ViGEmBusPresent   = (Test-ViGEmBusPresent)
         XboxPadVisible    = (Test-XboxPadVisible)
@@ -333,36 +308,29 @@ if ($SelfTest) {
 function Get-WatchdogDecision {
     param(
         [bool] $SteamRunning,
-        [bool] $GameRunning,
         [bool] $BridgeRunning,
         [bool] $ControllerPresent
     )
 
-    # A Steam GAME owns the controller: Steam Input claims it exclusively and the
-    # bridge would fight it (SteamlessController #79/#80). Steam merely being OPEN
-    # does not - and that case matters, because it is the one where you have
-    # finished a game and gone back to the Xbox app, where the bridge is the only
-    # thing making the pad work at all.
+    # Steam running means the bridge is off - game or no game. They cannot share
+    # the controller: tested with Steam open and the bridge also active, every
+    # press reached both, Steam took focus, and both apps acted on the same input.
     #
-    # This used to stop the bridge whenever steam.exe existed, which silently
-    # overrode the app's own "Auto - Off ONLY while in Steam game" mode: the mode
-    # would release the pad correctly and the watchdog would kill the process
-    # underneath it, so the pad never came back until Steam was closed. Closing
-    # Steam was then bolted on to compensate. Both halves are gone now.
-    if ($GameRunning) {
+    # Getting the pad back is done by the user closing Steam, never by us. An
+    # earlier version shut Steam down itself once it had sat in the background a
+    # while; from the outside that looked like Steam quitting at random.
+    if ($SteamRunning) {
         if ($BridgeRunning) {
-            return [pscustomobject]@{ Action = 'StopBridge'; Reason = 'a Steam game is running and owns the controller' }
+            return [pscustomobject]@{ Action = 'StopBridge'; Reason = 'Steam is running and owns the controller' }
         }
-        return [pscustomobject]@{ Action = 'None'; Reason = 'Steam Input is driving the pad' }
+        return [pscustomobject]@{ Action = 'None'; Reason = 'Steam is running - close it to get the Xbox controller back' }
     }
 
     if (-not $BridgeRunning) {
         if (-not $ControllerPresent) {
             return [pscustomobject]@{ Action = 'None'; Reason = 'waiting for the controller to appear' }
         }
-        $why = if ($SteamRunning) { 'Steam is open but no game - the bridge owns the pad' }
-               else                { 'no Steam - the bridge should own the pad' }
-        return [pscustomobject]@{ Action = 'StartBridge'; Reason = $why }
+        return [pscustomobject]@{ Action = 'StartBridge'; Reason = 'no Steam - the bridge should own the pad' }
     }
 
     return [pscustomobject]@{ Action = 'None'; Reason = 'bridge is driving the pad' }
@@ -389,68 +357,26 @@ function Get-XboxReturnDecision {
     return 'FocusXbox'
 }
 
-# Pure: what to do about a Steam process that is already up when we start.
-# Steam already running simply means the bridge waits. This used to close it,
-# on the reasoning that leftover Steam at logon was cruft - but the scheduled
-# task also restarts this script after a crash, so "at logon" was never a safe
-# assumption, and closing someone's Steam is not ours to do either way.
-function Get-StartupAction {
-    param([bool] $SteamRunning, [bool] $GameRunning)
-    if (-not $SteamRunning) { return 'None' }
-    if ($GameRunning)       { return 'AdoptGame' }
-    return 'None'
-}
-
 # Loaded by the test harness: define everything, then stop before the loop.
 if ($env:STEAMPAD_TEST_MODE -eq '1') { return }
 
 # ----------------------------------------------------------------- main loop
 Write-Log "Watchdog started. bridge='$($Config.BridgeExe)' steam='$($Config.SteamExe)'"
 
-$hadGame        = $false
-$noGameSince    = $null
-$lastScrub      = Get-Date
 $lastSteamSeen  = $false
 $fullscreenPid  = 0
 $fullscreenName = ''
 
-# Clean slate at startup: no Steam, bridge owns the pad - unless a game is
-# already running, in which case this is a restart mid-session and Steam stays.
-$steamAtStart = [bool](Get-SteamProcess)
-$gameAtStart  = $steamAtStart -and (Test-SteamGameRunning)
-switch (Get-StartupAction -SteamRunning $steamAtStart -GameRunning $gameAtStart) {
-    'AdoptGame' {
-        Write-Log 'A Steam game is already running; leaving Steam alone (restart mid-session).' 'warn'
-        $hadGame       = $true
-        $lastSteamSeen = $true
-    }
-}
-
 while ($true) {
     try {
         $steamRunning = [bool](Get-SteamProcess)
-        $gameRunning  = $false
 
-        if ($steamRunning) {
-            $gameRunning = Test-SteamGameRunning
-            if ($gameRunning) {
-                if (-not $hadGame) { Write-Log 'Steam game detected; Steam Input is driving the pad.' }
-                $hadGame = $true
-                $noGameSince = $null
-            } elseif ($null -eq $noGameSince) {
-                $noGameSince = Get-Date
-            }
-        } else {
-            if ($lastSteamSeen) {
-                Write-Log 'Steam is gone - returning the controller to the bridge.'
-                Start-Sleep -Seconds ([int]$Config.BridgeStartDelaySeconds)
-            }
-            $hadGame = $false
-            $noGameSince = $null
+        # Steam just closed: give it a moment to let go of the device before the
+        # bridge tries to claim it.
+        if (-not $steamRunning -and $lastSteamSeen) {
+            Write-Log 'Steam is gone - returning the controller to the bridge.'
+            Start-Sleep -Seconds ([int]$Config.BridgeStartDelaySeconds)
         }
-
-        $noGameSeconds = 0
-        if ($null -ne $noGameSince) { $noGameSeconds = ((Get-Date) - $noGameSince).TotalSeconds }
 
         # Remember the last full screen thing that was not the shell, so that
         # when it disappears we know a game just ended rather than a window.
@@ -481,7 +407,6 @@ while ($true) {
 
         $decision = Get-WatchdogDecision `
             -SteamRunning $steamRunning `
-            -GameRunning $gameRunning `
             -BridgeRunning $bridgeRunning `
             -ControllerPresent $controllerPresent
 

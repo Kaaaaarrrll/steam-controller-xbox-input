@@ -247,7 +247,7 @@ foreach ($name in @('SteamlessController','Steamless Controller')) {
     }
 }
 Say "Untick 'Start with Windows' inside SteamlessController, so it starts elevated from the task instead."
-Say "Set its mode to 'Off ONLY while in Steam game' - the manual toggle is runtime-only and never persisted."
+Say "Set its mode to 'Off while Steam is running' - the manual toggle is runtime-only and never persisted."
 
 # --------------------------------------------------------------------- config
 Step 'Writing configuration'

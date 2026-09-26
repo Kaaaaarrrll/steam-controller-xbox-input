@@ -13,63 +13,65 @@ if (-not $env:LOCALAPPDATA) {
 
 $cases = @(
     @{ n='Boot: nothing running, pad attached -> start bridge'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$false;ControllerPresent=$true}
+       a=@{SteamRunning=$false;BridgeRunning=$false;ControllerPresent=$true}
        e='StartBridge' }
 
     @{ n='Boot: pad not attached yet -> wait, do not spawn bridge'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$false;ControllerPresent=$false}
+       a=@{SteamRunning=$false;BridgeRunning=$false;ControllerPresent=$false}
        e='None' }
 
     @{ n='Steady state in Xbox UI: bridge up, no Steam -> nothing to do'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
+       a=@{SteamRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
        e='None' }
 
-    @{ n='Steam open but no game, bridge holds the pad -> keep it (Big Picture reads the virtual pad)'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
-       e='None' }
-
-    @{ n='Steam game running -> hands off, let Steam Input drive'
-       a=@{SteamRunning=$true;GameRunning=$true;BridgeRunning=$false;ControllerPresent=$true}
-       e='None' }
-
-    @{ n='THE SCENARIO: game exited, Steam still open, back in the Xbox app -> bridge takes the pad back'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;ControllerPresent=$true}
-       e='StartBridge' }
-
-    @{ n='Bridge respawned during a Steam game -> kill it (this is the pad-stealing case)'
-       a=@{SteamRunning=$true;GameRunning=$true;BridgeRunning=$true;ControllerPresent=$true}
+    @{ n='Steam opens while the bridge holds the pad -> stop the bridge'
+       a=@{SteamRunning=$true;BridgeRunning=$true;ControllerPresent=$true}
        e='StopBridge' }
 
+    @{ n='Steam open, bridge off -> stay off until the user closes Steam'
+       a=@{SteamRunning=$true;BridgeRunning=$false;ControllerPresent=$true}
+       e='None' }
+
     @{ n='Steam closed, bridge already back -> nothing to do'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
+       a=@{SteamRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
        e='None' }
 )
 
-# The watchdog closed Steam for nine days before anyone connected the two, because
-# the symptom - Steam vanishing - looks nothing like a controller tool. So this is
-# not one case among the others: it sweeps the whole input space and asserts that
-# no combination of observations can ever produce an action that closes Steam.
+# Two properties matter more than any single case, so they are checked across the
+# whole input space rather than by example.
+#
+# 1. Nothing here may ever close Steam. It did for nine days before anyone
+#    connected the two, because the symptom - Steam vanishing - looks nothing like
+#    a controller tool.
+# 2. The bridge may never be running while Steam is. Tested on hardware: with both
+#    active, every press reaches both apps at once.
 $closeSteamEscapes = @()
+$sharedWithSteam   = @()
 foreach ($steam in @($true, $false)) {
-  foreach ($game in @($true, $false)) {
-    foreach ($bridge in @($true, $false)) {
-      foreach ($pad in @($true, $false)) {
-        $d = Get-WatchdogDecision -SteamRunning $steam -GameRunning $game `
-                                  -BridgeRunning $bridge -ControllerPresent $pad
-        if ($d.Action -notin @('None', 'StartBridge', 'StopBridge')) {
-            $closeSteamEscapes += "$steam/$game/$bridge/$pad -> $($d.Action)"
-        }
+  foreach ($bridge in @($true, $false)) {
+    foreach ($pad in @($true, $false)) {
+      $d = Get-WatchdogDecision -SteamRunning $steam -BridgeRunning $bridge -ControllerPresent $pad
+      if ($d.Action -notin @('None', 'StartBridge', 'StopBridge')) {
+          $closeSteamEscapes += "$steam/$bridge/$pad -> $($d.Action)"
       }
+      $bridgeAfter = ($bridge -and $d.Action -ne 'StopBridge') -or $d.Action -eq 'StartBridge'
+      if ($steam -and $bridgeAfter) { $sharedWithSteam += "steam=$steam bridge=$bridge pad=$pad -> $($d.Action)" }
     }
   }
 }
 
 $pass = 0; $fail = 0
 if ($closeSteamEscapes.Count -eq 0) {
-    $pass++; Write-Host "  PASS  No input combination can close Steam (16 combinations swept)" -ForegroundColor Green
+    $pass++; Write-Host "  PASS  No input combination can close Steam (8 combinations swept)" -ForegroundColor Green
 } else {
     $fail++
     Write-Host ("  FAIL  Something can still close Steam:`n        {0}" -f ($closeSteamEscapes -join "`n        ")) -ForegroundColor Red
+}
+if ($sharedWithSteam.Count -eq 0) {
+    $pass++; Write-Host "  PASS  The bridge is never left running alongside Steam (8 combinations swept)" -ForegroundColor Green
+} else {
+    $fail++
+    Write-Host ("  FAIL  The bridge stays up while Steam runs:`n        {0}" -f ($sharedWithSteam -join "`n        ")) -ForegroundColor Red
 }
 foreach ($c in $cases) {
     $splat = $c.a
@@ -105,20 +107,6 @@ foreach ($c in $xboxChecks) {
     else { $fail++; Write-Host ("  FAIL  {0}`n        expected '{1}' got '{2}'" -f $c.n, $c.e, $c.got) -ForegroundColor Red }
 }
 
-# --------------------------------------------------------------- startup tests
-# Steam already running at startup just means the bridge waits its turn.
-$startupChecks = @(
-    @{ n='Startup with no Steam -> nothing to clean up'
-       got=(Get-StartupAction -SteamRunning $false -GameRunning $false); e='None' }
-    @{ n='Startup with Steam already up, no game -> leave it (was: shut it down)'
-       got=(Get-StartupAction -SteamRunning $true  -GameRunning $false); e='None' }
-    @{ n='Restart lands mid-game -> adopt it, never kill Steam under a game'
-       got=(Get-StartupAction -SteamRunning $true  -GameRunning $true);  e='AdoptGame' }
-)
-foreach ($c in $startupChecks) {
-    if ($c.got -eq $c.e) { $pass++; Write-Host ("  PASS  {0}" -f $c.n) -ForegroundColor Green }
-    else { $fail++; Write-Host ("  FAIL  {0}`n        expected '{1}' got '{2}'" -f $c.n, $c.e, $c.got) -ForegroundColor Red }
-}
 
 # ------------------------------------------------------------ process counting
 # Regression: Get-Process returns a bare object for a single match, and under
