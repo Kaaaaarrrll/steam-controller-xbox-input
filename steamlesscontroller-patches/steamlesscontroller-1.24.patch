@@ -1,0 +1,1547 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b7eba9c..a5dbf1d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,9 +10,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ add_library(SteamController STATIC
+     src/hid/HidDevice.cpp
+     src/steam/SteamController.cpp
++    src/steam/AudioHaptics.cpp
+ )
+ target_include_directories(SteamController PUBLIC src)
+-target_link_libraries(SteamController PUBLIC hid setupapi)
++target_link_libraries(SteamController PUBLIC hid setupapi ole32 winmm)
+ if (MSVC)
+     target_compile_options(SteamController PRIVATE /W4 /WX /utf-8)
+ endif()
+@@ -216,3 +217,13 @@ target_link_libraries(SteamlessController PRIVATE
+ if (MSVC)
+     target_compile_options(SteamlessController PRIVATE /W4 /WX /utf-8 /wd4828)
+ endif()
++
++# Standalone check of the audio-haptics capture path, because AudioHaptics runs
++# inside an elevated process where its failures cannot be observed.
++add_executable(AudioHapticsProbe
++    src/probe/AudioHapticsProbe.cpp
++)
++target_link_libraries(AudioHapticsProbe PRIVATE SteamController ole32 winmm hid)
++if (MSVC)
++    target_compile_options(AudioHapticsProbe PRIVATE /W4 /utf-8)
++endif()
+diff --git a/src/app/ControllerManager.cpp b/src/app/ControllerManager.cpp
+index 32e2a37..3eb022f 100644
+--- a/src/app/ControllerManager.cpp
++++ b/src/app/ControllerManager.cpp
+@@ -1548,6 +1548,19 @@ void ControllerManager::ReadLoop(Slot* slot) {
+         // the click used to be hardcoded to a left button and only fired while
+         // that pad was driving the mouse.
+         if (hasPrev) {
++            // The "..." button between the pads toggles the Windows touch
++            // keyboard: press to show, press again to hide. Edge-detected on the
++            // press, so holding it does not flap the keyboard at report rate;
++            // Toggle() already hands its cross-process call to a worker.
++            if (n > 2) {
++                const bool qaNow = (buf[2]     & SteamController::BTN_QUICK_ACCESS) != 0;
++                const bool qaWas = (prevBuf[2] & SteamController::BTN_QUICK_ACCESS) != 0;
++                if (qaNow && !qaWas) {
++                    EventLog::Write("QUICKACCESS: toggling the touch keyboard");
++                    TouchKeyboard::Toggle();
++                }
++            }
++
+             // A pad set to feed the DS4 touchpad has no click binding to
+             // dispatch — its press is the touchpad press. EffectiveClick
+             // returns nothing in that case, so a binding left behind by an
+diff --git a/src/app/RemapWindow.cpp b/src/app/RemapWindow.cpp
+index 4f14146..073169a 100644
+--- a/src/app/RemapWindow.cpp
++++ b/src/app/RemapWindow.cpp
+@@ -3,6 +3,7 @@
+ #include "ControllerManager.h"
+ #include "EventLog.h"
+ #include "ProcessIdentity.h"
++#include "../steam/AudioHaptics.h"
+ #include <shellapi.h>
+ #include <shlobj.h>
+ #include <shobjidl.h>
+@@ -14,6 +15,7 @@
+ #include <thread>
+ #include <cstring>
+ #include <cstdlib>
++#include <cstdio>
+ 
+ RemapWindow* RemapWindow::s_instance = nullptr;
+ 
+@@ -359,6 +361,187 @@ R"HTML(
+   </div>
+ </div>
+ )HTML"
++// Audio haptics - an addition to upstream SteamlessController. Its styles, its
++// pane and its script all live in this one piece, so nothing else on the page
++// changes: the pane sits after the existing markup, and the tab strip is placed
++// under the title bar when the page loads. Kept well under the 12KB budget.
++R"HTML(
++<style>
++#hap-tabs{display:flex;gap:2px;padding:0 20px;border-bottom:1px solid rgba(255,255,255,.08);flex:none;}
++.hap-tab{background:none;border:none;border-bottom:2px solid transparent;color:#7d8b98;font-family:inherit;font-size:12.5px;font-weight:600;letter-spacing:.3px;padding:6px 12px;cursor:pointer;transition:color .15s,border-color .15s;}
++.hap-tab:hover{color:#c3ced8;}
++.hap-tab.on{color:#4ea3ff;border-bottom-color:#4ea3ff;}
++#hap-body{flex:1;display:flex;flex-direction:column;padding:18px 26px;gap:14px;overflow-y:auto;min-height:0;}
++.hap-row{display:flex;flex-direction:column;gap:3px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:5px;padding:5px 10px;}
++.hap-head{display:flex;justify-content:space-between;align-items:baseline;}
++.hap-name{font-size:13px;color:#c3ced8;}
++.hap-val{font-family:'JetBrains Mono',monospace;font-size:12px;color:#4ea3ff;}
++.hap-note{font-size:10.5px;color:#5c6b78;line-height:1.35;}
++#hap-eq{display:flex;justify-content:space-between;gap:6px;padding:2px;}
++.eq-band{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;}
++.eq-band input[type=range]{-webkit-appearance:slider-vertical;writing-mode:vertical-lr;direction:rtl;width:6px;height:70px;}
++.eq-hz{font-family:'JetBrains Mono',monospace;font-size:11px;color:#7d8b98;}
++.eq-val{font-family:'JetBrains Mono',monospace;font-size:10px;color:#4ea3ff;}
++.eq-val.off{color:#5c6b78;}
++.hap-check{display:flex;align-items:center;gap:10px;}
++.hap-check label{font-size:13px;color:#c3ced8;cursor:pointer;}
++</style>
++
++<div id="hap-body" style="display:none;">
++  <p class="instr">Plays your system audio through the trackpads. <b>Normal rumble is off</b> while this is on, and every change applies immediately.</p>
++
++  <div class="group">
++    <div class="hap-check">
++      <input type="checkbox" id="hap-on">
++      <label for="hap-on">Replace rumble with audio haptics</label>
++    </div>
++  </div>
++
++  <div class="group">
++    <div class="group-label">STRENGTH</div>
++    <div class="hap-row">
++      <div class="hap-head"><span class="hap-name">Strength</span><span class="hap-val" id="hap-gain-v"></span></div>
++      <input type="range" id="hap-gain" min="25" max="2000">
++    </div>
++  </div>
++
++  <div class="group">
++    <div class="group-label">EQUALISER (Hz)</div>
++    <div class="hap-row">
++      <div id="hap-eq"></div>
++      <div class="hap-note">A band at zero is removed entirely. Little above 120 Hz is felt as texture.</div>
++    </div>
++  </div>
++
++  <div class="group">
++    <div class="group-label">TIMING</div>
++    <div class="hap-row">
++      <div class="hap-head"><span class="hap-name">Delay (sync to speakers)</span><span class="hap-val" id="hap-delay-v"></span></div>
++      <input type="range" id="hap-delay" min="0" max="500">
++      <div class="hap-note">The pad otherwise leads the speakers. Only the sound is delayed, never the response.</div>
++    </div>
++    <div class="hap-row">
++      <div class="hap-head"><span class="hap-name">Buffer (higher is smoother)</span><span class="hap-val" id="hap-buf-v"></span></div>
++      <input type="range" id="hap-buf" min="4" max="64">
++    </div>
++    <div class="row mode-row">
++      <div class="row-top">
++        <span class="pos-label">Transport rate</span>
++        <div class="connector"></div>
++        <select id="hap-rate" class="mode-select">
++          <option value="4000">4 kHz (wireless)</option>
++          <option value="8000">8 kHz</option>
++        </select>
++      </div>
++    </div>
++    <div class="hap-note">A write waits 4 ms for the radio slot, so 4 kHz is the sustainable wireless rate.</div>
++  </div>
++
++  <div class="group">
++    <div class="group-label">WHEN</div>
++    <div class="hap-row">
++      <div class="hap-check">
++        <input type="checkbox" id="hap-gate">
++        <label for="hap-gate">Only while the game asks for rumble</label>
++      </div>
++      <div class="hap-note">The game supplies the timing, the audio supplies the texture - so the pad stays silent until the game asks for rumble.</div>
++    </div>
++  </div>
++</div>
++
++<script>
++(function(){
++  'use strict';
++  var HAP_HZ = ['30','60','120','240','480','960'];
++  var ready = false;
++  var $ = function(id){ return document.getElementById(id); };
++
++  // Built here rather than in the page's own markup, so this addition stays in
++  // one place.
++  var strip = document.createElement('div');
++  strip.id = 'hap-tabs';
++  strip.innerHTML = '<button class="hap-tab on" id="hap-tab-controls">Controls</button>'
++                  + '<button class="hap-tab" id="hap-tab-haptics">Audio Haptics</button>';
++  $('titlebar').insertAdjacentElement('afterend', strip);
++
++  function show(haptics){
++    // A row left listening keeps the host capturing the controller, and its only
++    // sign is a highlight on a pane about to be hidden - so the next button
++    // press would rebind something invisibly. The game picker likewise.
++    if (haptics) {
++      if (typeof cancelListening === 'function') cancelListening();
++      if (typeof closeCombo === 'function') closeCombo();
++    }
++    $('body').style.display     = haptics ? 'none' : '';
++    // Apply and Reset commit a controller profile. Haptics apply live, so the
++    // bar would imply something was waiting to be saved.
++    $('footer').style.display   = haptics ? 'none' : '';
++    $('hap-body').style.display = haptics ? '' : 'none';
++    $('hap-tab-controls').className = haptics ? 'hap-tab' : 'hap-tab on';
++    $('hap-tab-haptics').className  = haptics ? 'hap-tab on' : 'hap-tab';
++  }
++  $('hap-tab-controls').onclick = function(){ show(false); };
++  $('hap-tab-haptics').onclick  = function(){ show(true); };
++
++  var eq = '';
++  for (var i = 0; i < HAP_HZ.length; i++) {
++    eq += '<div class="eq-band"><input type="range" id="eq-' + i + '" min="0" max="400">'
++        + '<div class="eq-hz">' + HAP_HZ[i] + '</div><div class="eq-val" id="eq-v-' + i + '"></div></div>';
++  }
++  $('hap-eq').innerHTML = eq;
++
++  function labels(){
++    $('hap-gain-v').textContent  = $('hap-gain').value + '%';
++    $('hap-delay-v').textContent = $('hap-delay').value + ' ms';
++    $('hap-buf-v').textContent   = $('hap-buf').value + ' packets';
++    for (var i = 0; i < HAP_HZ.length; i++) {
++      var v = $('eq-' + i).value, el = $('eq-v-' + i);
++      el.textContent = v === '0' ? 'off' : v + '%';
++      el.className   = v === '0' ? 'eq-val off' : 'eq-val';
++    }
++  }
++
++  // The host applies every change live, which is why this tab has no Apply.
++  function send(){
++    if (!ready || !(window.chrome && window.chrome.webview)) return;
++    labels();
++    var m = {type:'haptics',
++      on:   $('hap-on').checked ? '1' : '0',
++      gain: $('hap-gain').value, delay: $('hap-delay').value,
++      buf:  $('hap-buf').value,  rate:  $('hap-rate').value,
++      gate: $('hap-gate').checked ? '1' : '0'};
++    for (var i = 0; i < HAP_HZ.length; i++) m['eq' + i] = $('eq-' + i).value;
++    window.chrome.webview.postMessage(JSON.stringify(m));
++  }
++
++  var ids = ['hap-on','hap-gain','hap-delay','hap-buf','hap-rate','hap-gate'];
++  for (var j = 0; j < HAP_HZ.length; j++) ids.push('eq-' + j);
++  ids.forEach(function(id){
++    $(id).addEventListener('input',  send);
++    $(id).addEventListener('change', send);
++  });
++
++  // A listener of its own, for a message of its own: the page's init handling
++  // is untouched.
++  if (window.chrome && window.chrome.webview) {
++    window.chrome.webview.addEventListener('message', function(e){
++      var st;
++      try { st = JSON.parse(e.data); } catch (err) { return; }
++      if (!st || st.type !== 'hapticsState') return;
++      $('hap-on').checked   = st.on === '1';
++      $('hap-gain').value   = st.gain;
++      $('hap-delay').value  = st.delay;
++      $('hap-buf').value    = st.buf;
++      $('hap-rate').value   = st.rate;
++      $('hap-gate').checked = st.gate === '1';
++      for (var i = 0; i < HAP_HZ.length; i++) $('eq-' + i).value = st['eq' + i];
++      labels();
++      ready = true;
++    });
++  }
++})();
++</script>
++)HTML"
+ // The page is split across several adjacent string literals only because MSVC
+ // caps one at 16380 bytes (C2026); the compiler concatenates them straight
+ // back into a single document, so a split can go anywhere two complete lines
+@@ -2069,6 +2252,80 @@ static std::string JsonStr(const std::string& json, const std::string& key) {
+     return end != std::string::npos ? json.substr(pos, end - pos) : std::string{};
+ }
+ 
++// ---------------------------------------------------------------------------
++// Audio haptics - an addition to upstream. Its settings live in the registry,
++// where AudioHaptics reads them; the page writes them on every change and the
++// engine reloads, so the tab has no Apply step.
++// ---------------------------------------------------------------------------
++
++namespace {
++
++void WriteHapticSetting(const wchar_t* name, DWORD value) {
++    HKEY key = nullptr;
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\SteamlessController", 0, nullptr, 0,
++                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
++        return;
++    }
++    RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
++    RegCloseKey(key);
++}
++
++DWORD ReadHapticSetting(const wchar_t* name, DWORD fallback) {
++    DWORD data = 0;
++    DWORD cb = sizeof(data);
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController", name, RRF_RT_REG_DWORD,
++                     nullptr, &data, &cb) != ERROR_SUCCESS) {
++        return fallback;
++    }
++    return data;
++}
++
++// Must match AudioHaptics' own defaults, or the tab would show values the
++// engine is not using. Haptics are off by default: they replace the game's
++// own rumble, so they are opt-in.
++constexpr DWORD kHapticBandDefaults[AudioHaptics::kBandCount] = {400, 160, 0, 0, 0, 0};
++
++void ApplyHapticsMessage(const std::string& msg) {
++    auto num = [&](const char* key, DWORD fallback) -> DWORD {
++        const std::string v = JsonStr(msg, key);
++        return v.empty() ? fallback : static_cast<DWORD>(std::strtoul(v.c_str(), nullptr, 10));
++    };
++    WriteHapticSetting(L"HapticAudioMode",    num("on", 0));
++    WriteHapticSetting(L"HapticAudioGain",    num("gain", 854));
++    WriteHapticSetting(L"HapticAudioDelayMs", num("delay", 68));
++    WriteHapticSetting(L"HapticAudioLatency", num("buf", 64));
++    WriteHapticSetting(L"HapticAudioRate",    num("rate", 4000));
++    WriteHapticSetting(L"HapticRumbleGate",   num("gate", 1));
++    for (int band = 0; band < AudioHaptics::kBandCount; ++band) {
++        char key[8];
++        std::snprintf(key, sizeof(key), "eq%d", band);
++        wchar_t name[32];
++        _snwprintf_s(name, _TRUNCATE, L"HapticEqBand%d", band);
++        WriteHapticSetting(name, num(key, kHapticBandDefaults[band]));
++    }
++    AudioHaptics::Instance().Reload();
++}
++
++std::wstring HapticsStateJson() {
++    std::wstring json =
++        L"{\"type\":\"hapticsState\""
++        L",\"on\":\""    + std::to_wstring(ReadHapticSetting(L"HapticAudioMode", 0))     + L"\""
++        L",\"gain\":\""  + std::to_wstring(ReadHapticSetting(L"HapticAudioGain", 854))   + L"\""
++        L",\"delay\":\"" + std::to_wstring(ReadHapticSetting(L"HapticAudioDelayMs", 68)) + L"\""
++        L",\"buf\":\""   + std::to_wstring(ReadHapticSetting(L"HapticAudioLatency", 64)) + L"\""
++        L",\"rate\":\""  + std::to_wstring(ReadHapticSetting(L"HapticAudioRate", 4000))  + L"\""
++        L",\"gate\":\""  + std::to_wstring(ReadHapticSetting(L"HapticRumbleGate", 1))    + L"\"";
++    for (int band = 0; band < AudioHaptics::kBandCount; ++band) {
++        wchar_t name[32];
++        _snwprintf_s(name, _TRUNCATE, L"HapticEqBand%d", band);
++        json += L",\"eq" + std::to_wstring(band) + L"\":\""
++              + std::to_wstring(ReadHapticSetting(name, kHapticBandDefaults[band])) + L"\"";
++    }
++    return json + L"}";
++}
++
++} // namespace
++
+ void RemapWindow::OnWebMessage(const std::wstring& raw) {
+     // All message content is ASCII; narrow explicitly to suppress C4244.
+     std::string msg;
+@@ -2077,6 +2334,11 @@ void RemapWindow::OnWebMessage(const std::wstring& raw) {
+ 
+     std::string type = JsonStr(msg, "type");
+ 
++    if (type == "haptics") {   // the Audio Haptics tab - see ApplyHapticsMessage
++        ApplyHapticsMessage(msg);
++        return;
++    }
++
+     if (type == "startDrag") {
+         // Safe to call from WndProc context (we're on the UI thread).
+         ReleaseCapture();
+@@ -2336,6 +2598,9 @@ void RemapWindow::SendInitState() {
+         L",\"games\":[" + GamesJson() + L"]"
+         L",\"profiles\":{" + ProfilesJson() + L"}}";
+     PostToWebView(json);
++    // The Audio Haptics tab's values, in a message of their own so the init
++    // message above stays exactly as it was.
++    PostToWebView(HapticsStateJson());
+ 
+     // Sent separately rather than folded into the init message: the same state
+     // arrives later whenever it changes, so the page needs one handler for it
+diff --git a/src/app/TrackpadInput.cpp b/src/app/TrackpadInput.cpp
+index c04cf1b..37bb861 100644
+--- a/src/app/TrackpadInput.cpp
++++ b/src/app/TrackpadInput.cpp
+@@ -41,6 +41,8 @@ void TrackpadInput::Reset() {
+     m_sector         = -1;
+     m_clickHeld      = false;
+     m_clickInCentre  = true;
++
++    m_pressHoldUntil = {};
+ }
+ 
+ // Tracks whether accepted movement is reaching the cursor. Re-arms whenever the
+@@ -338,11 +340,21 @@ void TrackpadInput::Update(const uint8_t* buf, size_t n, bool pressed) {
+         return;
+     }
+ 
++    // Pressing a pad hard enough to click rolls the fingertip, and the pointer
++    // followed it - so the cursor moved between button-down and button-up and
++    // Windows read the click as a drag. Hold still while the pad is pressed
++    // (the caller's contact-area detector, see kPadPressArea) and for a moment
++    // after, while the finger settles. The travel is dropped rather than
++    // banked: m_prevX/m_prevY still advance below, so nothing jumps on release.
++    const auto now = std::chrono::steady_clock::now();
++    if (pressed) m_pressHoldUntil = now + kPressHold;
++    const bool held = now < m_pressHoldUntil;
++
+     if (touching && m_touching) {
+         const int dxRaw = static_cast<int>(x - m_prevX);
+         const int dyRaw = static_cast<int>(y - m_prevY);
+         NoteJump(buf, n, dxRaw, dyRaw);
+-        if (dxRaw != 0 || dyRaw != 0) {
++        if (!held && (dxRaw != 0 || dyRaw != 0)) {
+             if (m_mode == TrackpadMode::MousePointer) {
+                 // Pad Y grows upward, screen Y grows downward.
+                 UpdatePointer(dxRaw, -dyRaw);
+diff --git a/src/app/TrackpadInput.h b/src/app/TrackpadInput.h
+index b23b0b9..cdbbc56 100644
+--- a/src/app/TrackpadInput.h
++++ b/src/app/TrackpadInput.h
+@@ -139,4 +139,12 @@ private:
+     std::chrono::steady_clock::time_point m_lastJumpLogAt{};
+     bool m_haveFrameTime  = false;
+     bool m_haveLoggedJump = false;
++
++    // ---- Holding still for a press ----
++
++    // Movement is dropped until this time - see Update. Pushed forward on
++    // every pressed report, so the hold is measured from the END of a press.
++    std::chrono::steady_clock::time_point m_pressHoldUntil{};
++    // How long the fingertip keeps moving the centroid after a press ends.
++    static constexpr std::chrono::milliseconds kPressHold{120};
+ };
+diff --git a/src/app/TrayApp.cpp b/src/app/TrayApp.cpp
+index 3f22813..c38ad69 100644
+--- a/src/app/TrayApp.cpp
++++ b/src/app/TrayApp.cpp
+@@ -1737,11 +1737,18 @@ void TrayApp::ShowViGEmBalloon() {
+     nid.uID              = TRAY_UID;
+     nid.uFlags           = NIF_INFO;
+     nid.dwInfoFlags      = NIIF_WARNING;
+-    wcscpy_s(nid.szInfoTitle, missing ? L"Driver required" : L"Virtual gamepad unavailable");
++    // Says what the driver is FOR and what usually removes it. "ViGEmBus is
++    // unavailable" read to a user as "you need a new version of something",
++    // after an uninstaller for another app had taken the driver with it. The
++    // body is 213 of the 255 characters szInfo holds, and wcscpy_s aborts
++    // rather than truncating, so measure before lengthening it.
++    wcscpy_s(nid.szInfoTitle, missing ? L"Xbox controller driver missing" : L"Virtual gamepad unavailable");
+     wcscpy_s(nid.szInfo,
+              missing
+-                 ? L"ViGEmBus is unavailable — not installed, or disabled in Device "
+-                   L"Manager under System devices. Click here to download it."
++                 ? L"The driver that lets your Steam Controller act as an Xbox pad "
++                   L"(ViGEmBus) is missing or switched off. Uninstalling a streaming "
++                   L"or controller app like Apollo or Sunshine often removes it. "
++                   L"Click here to reinstall it."
+                  : L"A virtual gamepad bus is present but would not accept a "
+                    L"controller. It may be disabled, or a version this app cannot "
+                    L"talk to. The event log has the details.");
+diff --git a/src/probe/AudioHapticsProbe.cpp b/src/probe/AudioHapticsProbe.cpp
+new file mode 100644
+index 0000000..50a0753
+--- /dev/null
++++ b/src/probe/AudioHapticsProbe.cpp
+@@ -0,0 +1,203 @@
++// Identifies which controller interface actually drives the haptic actuators,
++// and prints what distinguishes it.
++//
++// Accepting a write is not proof of being wired to anything: four of the five
++// vendor collections accept a stream report, and only one moves the pad. The
++// engine used to take the first that answered, which is a guess - and on this
++// hardware the wrong one. This dumps each interface's HID capabilities so the
++// right one can be selected by a stable property rather than by ordinal.
++//
++// Build: cmake --build build/release --config Release --target AudioHapticsProbe
++// Run:   build\release\Release\AudioHapticsProbe.exe [rate] [--caps-only]
++
++#include <windows.h>
++
++#include <hidsdi.h>
++#include <timeapi.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "../hid/HidDevice.h"
++
++namespace {
++
++constexpr uint16_t kVendor = 0x28DE;
++constexpr uint16_t kPids[] = {0x1302, 0x1303, 0x1304};
++constexpr uint16_t kVendorUsagePage = 0xFF00;
++constexpr uint8_t  kPcmMode = 0x86;
++constexpr uint8_t  kStream  = 0x88;
++
++uint8_t LinearToMuLaw(int16_t sample) {
++    constexpr int kBias = 0x84;
++    constexpr int kClip = 32635;
++    int value = sample;
++    const int sign = (value >> 8) & 0x80;
++    if (sign != 0) value = -value;
++    if (value > kClip) value = kClip;
++    value += kBias;
++    int exponent = 7;
++    for (int mask = 0x4000; (value & mask) == 0 && exponent > 0; mask >>= 1) --exponent;
++    const int mantissa = (value >> (exponent + 3)) & 0x0F;
++    return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
++}
++
++void SetPcm(HidDevice& device, bool enable, int rate) {
++    for (uint8_t side : {uint8_t{2}, uint8_t{5}}) {
++        uint8_t report[64] = {};
++        report[0] = kPcmMode;
++        report[1] = enable ? 0x02 : 0x01;
++        report[2] = side;
++        report[3] = enable ? static_cast<uint8_t>(rate == 8000 ? 8 : 9) : 0;
++        device.WriteOutputReport(report, sizeof(report));
++    }
++}
++
++/** Reads the HID capabilities of one interface path, for a discriminator. */
++void PrintCaps(const std::wstring& path, int index) {
++    const HANDLE handle = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++                                      OPEN_EXISTING, 0, nullptr);
++    if (handle == INVALID_HANDLE_VALUE) {
++        std::printf("    [%d] could not open for caps\n", index);
++        return;
++    }
++    PHIDP_PREPARSED_DATA preparsed = nullptr;
++    if (HidD_GetPreparsedData(handle, &preparsed)) {
++        HIDP_CAPS caps{};
++        if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS) {
++            std::printf("    [%d] usage=%04X page=%04X  out=%u in=%u feat=%u\n", index,
++                        caps.Usage, caps.UsagePage, caps.OutputReportByteLength,
++                        caps.InputReportByteLength, caps.FeatureReportByteLength);
++        }
++        HidD_FreePreparsedData(preparsed);
++    }
++    // The interface number is in the path as &mi_NN, and is stable across boots
++    // in a way an enumeration index is not.
++    const size_t at = path.find(L"&mi_");
++    if (at != std::wstring::npos) {
++        std::wprintf(L"         path mi=%.5s  col=%.10s\n", path.c_str() + at + 4,
++                     path.find(L"&col") != std::wstring::npos
++                         ? path.c_str() + path.find(L"&col") + 4
++                         : L"-");
++    }
++    CloseHandle(handle);
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    int rate = 4000;
++    bool capsOnly = false;
++    for (int i = 1; i < argc; ++i) {
++        if (std::strcmp(argv[i], "--caps-only") == 0) capsOnly = true;
++        else rate = std::atoi(argv[i]);
++    }
++
++    std::printf("\nActuator interface identification  (rate %d Hz)\n", rate);
++    std::printf("----------------------------------------------\n");
++
++    std::vector<HidDevice> answered;
++    std::vector<std::wstring> answeredPaths;
++    int found = 0;
++
++    for (uint16_t pid : kPids) {
++        const std::vector<std::wstring> paths =
++            HidDevice::Enumerate(kVendor, pid, kVendorUsagePage);
++        if (!paths.empty()) {
++            std::printf("  pid %04X : %u vendor interface(s)\n", pid,
++                        static_cast<unsigned>(paths.size()));
++        }
++        found += static_cast<int>(paths.size());
++        for (const std::wstring& path : paths) {
++            HidDevice device;
++            if (!device.Open(path)) continue;
++            uint8_t probe[64] = {};
++            probe[0] = kStream;
++            if (!device.WriteOutputReport(probe, sizeof(probe))) {
++                device.Close();
++                continue;
++            }
++            answered.push_back(std::move(device));
++            answeredPaths.push_back(path);
++        }
++    }
++
++    std::printf("\n  found %d, accepted %u\n\n", found,
++                static_cast<unsigned>(answered.size()));
++    std::printf("  capabilities of each ACCEPTED interface:\n");
++    for (size_t i = 0; i < answeredPaths.size(); ++i) {
++        PrintCaps(answeredPaths[i], static_cast<int>(i));
++    }
++
++    if (answered.empty()) {
++        std::printf("\n  Nothing accepted. Untick the haptics box so the bridge releases\n");
++        std::printf("  the device, then run this again.\n\n");
++        return 1;
++    }
++    if (capsOnly) {
++        for (HidDevice& device : answered) device.Close();
++        std::printf("\n");
++        return 0;
++    }
++
++    std::printf("\n  Playing a 2.5 s tone down EACH interface in turn.\n");
++    std::printf("  Note which index you FEEL.\n\n");
++
++    for (size_t index = 0; index < answered.size(); ++index) {
++        std::printf("  >>> interface %u of %u ... ", static_cast<unsigned>(index),
++                    static_cast<unsigned>(answered.size()));
++        std::fflush(stdout);
++
++        HidDevice& device = answered[index];
++        SetPcm(device, false, rate);
++        Sleep(10);
++        SetPcm(device, true, rate);
++        Sleep(200);
++
++        timeBeginPeriod(1);
++        const auto period = std::chrono::microseconds(31000000 / rate);
++        auto next = std::chrono::steady_clock::now();
++        const auto until = next + std::chrono::milliseconds(2500);
++        double phase = 0.0;
++        const double step = 2.0 * 3.14159265358979 * 60.0 / rate;
++        int sent = 0;
++
++        while (std::chrono::steady_clock::now() < until) {
++            uint8_t report[64] = {};
++            report[0] = kStream;
++            report[1] = 31;
++            for (int i = 0; i < 31; ++i) {
++                const auto value = static_cast<int16_t>(std::sin(phase) * 26000.0);
++                phase += step;
++                report[2 + i]  = LinearToMuLaw(value);
++                report[33 + i] = LinearToMuLaw(value);
++            }
++            device.WriteOutputReport(report, sizeof(report));
++            ++sent;
++
++            next += period;
++            const auto now = std::chrono::steady_clock::now();
++            if (now > next + period * 4) { next = now; continue; }
++            const auto coarse = next - std::chrono::milliseconds(1);
++            if (std::chrono::steady_clock::now() < coarse) std::this_thread::sleep_until(coarse);
++            while (std::chrono::steady_clock::now() < next) YieldProcessor();
++        }
++        timeEndPeriod(1);
++
++        SetPcm(device, false, rate);
++        std::printf("%d reports\n", sent);
++        Sleep(800);
++    }
++
++    for (HidDevice& device : answered) device.Close();
++    std::printf("\n  Which index did you feel? That is the one the engine should use.\n\n");
++    return 0;
++}
+diff --git a/src/steam/AudioHaptics.cpp b/src/steam/AudioHaptics.cpp
+new file mode 100644
+index 0000000..72f847f
+--- /dev/null
++++ b/src/steam/AudioHaptics.cpp
+@@ -0,0 +1,627 @@
++#include "AudioHaptics.h"
++
++#include <windows.h>
++
++#include <audioclient.h>
++#include <mmdeviceapi.h>
++#include <mmreg.h>
++#include <timeapi.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++constexpr uint16_t kValveVendor   = 0x28DE;
++// Wired, Bluetooth and puck. Only the wired one carries 16-bit.
++constexpr uint16_t kPidWired      = 0x1302;
++constexpr uint16_t kPidBluetooth  = 0x1303;
++constexpr uint16_t kPidPuck       = 0x1304;
++// The actuators answer on the vendor-defined interface, not the mouse or
++// keyboard collections the pad also exposes in lizard mode.
++constexpr uint16_t kVendorUsagePage = 0xFF00;
++
++constexpr uint8_t kReportPcmMode = 0x86;
++constexpr uint8_t kReportStream  = 0x88;
++constexpr uint8_t kPcmDisable    = 0x01;
++constexpr uint8_t kPcmEnable     = 0x02;
++// The two haptic actuator channels.
++constexpr uint8_t kSideLeft      = 2;
++constexpr uint8_t kSideRight     = 5;
++
++// u-law carries 31 samples per channel in one 64-byte report; 16-bit carries 15.
++constexpr size_t kMuLawSamplesPerReport = 31;
++constexpr size_t kPcm16SamplesPerReport = 15;
++
++// The firmware needs this long between a disable and the following enable.
++constexpr DWORD kPcmSettleMs = 200;
++
++// Retry interval when the audio device went away.
++constexpr auto kRetryDelay = std::chrono::seconds(3);
++
++/** Reads one DWORD tunable, clamped. */
++DWORD ReadSetting(const wchar_t* name, DWORD fallback, DWORD maximum) {
++    DWORD data = 0;
++    DWORD cb   = sizeof(data);
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController", name,
++                     RRF_RT_REG_DWORD, nullptr, &data, &cb) != ERROR_SUCCESS) {
++        return fallback;
++    }
++    return data > maximum ? maximum : data;
++}
++
++/**
++ * G.711 u-law encode. Textbook algorithm, kept here so the transport does not
++ * depend on a codec library for thirteen lines of arithmetic.
++ */
++uint8_t LinearToMuLaw(int16_t sample) {
++    constexpr int kBias = 0x84;
++    constexpr int kClip = 32635;
++    int value = sample;
++    const int sign = (value >> 8) & 0x80;
++    if (sign != 0) value = -value;
++    if (value > kClip) value = kClip;
++    value += kBias;
++    int exponent = 7;
++    for (int mask = 0x4000; (value & mask) == 0 && exponent > 0; mask >>= 1) --exponent;
++    const int mantissa = (value >> (exponent + 3)) & 0x0F;
++    return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
++}
++
++// Band centres. Chosen for what the actuators can reproduce rather than what a
++// speaker can: above roughly 1 kHz a voice coil this size is barely felt, so
++// spending bands up there would waste the interface.
++const float kBandCentres[AudioHaptics::kBandCount] = {30.0f, 60.0f, 120.0f,
++                                                      240.0f, 480.0f, 960.0f};
++
++/**
++ * One second-order bandpass section, constant peak gain.
++ * A parallel bank of these is a graphic EQ: each band is filtered out on its
++ * own and scaled, so setting a band to zero genuinely removes that range
++ * instead of merely turning it down.
++ */
++struct Biquad {
++    float b0{0}, b1{0}, b2{0}, a1{0}, a2{0};
++    float x1{0}, x2{0}, y1{0}, y2{0};
++
++    void SetBandpass(float centreHz, float q, float sampleRate) {
++        if (centreHz >= sampleRate * 0.5f) { b0 = b1 = b2 = a1 = a2 = 0.0f; return; }
++        const float w     = 6.2831853f * centreHz / sampleRate;
++        const float alpha = std::sin(w) / (2.0f * q);
++        const float cosw  = std::cos(w);
++        const float a0    = 1.0f + alpha;
++        b0 =  alpha / a0;
++        b1 =  0.0f;
++        b2 = -alpha / a0;
++        a1 = (-2.0f * cosw) / a0;
++        a2 = (1.0f - alpha) / a0;
++    }
++
++    float Process(float x) {
++        const float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
++        x2 = x1; x1 = x; y2 = y1; y1 = y;
++        return y;
++    }
++};
++
++/** One-pole coefficient for a cutoff in Hz at a sample rate. */
++float OnePole(float cutoffHz, float sampleRate) {
++    if (cutoffHz <= 0.0f || sampleRate <= 0.0f) return 1.0f;
++    const float value = 1.0f - std::exp(-6.2831853f * cutoffHz / sampleRate);
++    return std::clamp(value, 0.0f, 1.0f);
++}
++
++/** Soft-knee limiter, so a loud passage compresses instead of clipping. */
++float SoftLimit(float value) {
++    if (value > 1.0f)  return 1.0f;
++    if (value < -1.0f) return -1.0f;
++    return value - (value * value * value) / 3.0f;
++}
++
++} // namespace
++
++AudioHaptics& AudioHaptics::Instance() {
++    static AudioHaptics instance;
++    return instance;
++}
++
++AudioHaptics::~AudioHaptics() {
++    Stop();
++}
++
++bool AudioHaptics::Enabled() {
++    return ReadSetting(L"HapticAudioMode", 0, 1) != 0;
++}
++
++float AudioHaptics::Gain() {
++    return static_cast<float>(ReadSetting(L"HapticAudioGain", 854, 2000)) / 100.0f;
++}
++
++float AudioHaptics::BandGain(int band) {
++    if (band < 0 || band >= kBandCount) return 0.0f;
++    // Tuned by hand on real hardware, not derived: every band above 120 Hz
++    // is off because nothing up there is felt as texture on these actuators,
++    // and the bottom two sit at maximum because that is where the authority
++    // is. A flat EQ feels like noise; this feels like impact.
++    static const DWORD defaults[kBandCount] = {400, 160, 0, 0, 0, 0};
++    wchar_t name[32];
++    _snwprintf_s(name, _TRUNCATE, L"HapticEqBand%d", band);
++    return static_cast<float>(ReadSetting(name, defaults[band], 400)) / 100.0f;
++}
++
++float AudioHaptics::DelayMs() {
++    return static_cast<float>(ReadSetting(L"HapticAudioDelayMs", 68, 500));
++}
++
++bool AudioHaptics::RumbleGated() {
++    return ReadSetting(L"HapticRumbleGate", 1, 1) != 0;
++}
++
++float AudioHaptics::RumbleReleaseMs() {
++    const DWORD ms = ReadSetting(L"HapticRumbleRelease", 220, 3000);
++    return ms < 20 ? 20.0f : static_cast<float>(ms);
++}
++
++void AudioHaptics::SetRumbleLevel(float level) {
++    // Recorded unconditionally and consulted only when gating is on, so turning
++    // the setting on takes effect on the next rumble rather than the next game.
++    m_rumbleLevel.store(std::clamp(level, 0.0f, 1.0f), std::memory_order_relaxed);
++    m_rumbleAtMs.store(static_cast<long long>(GetTickCount64()), std::memory_order_relaxed);
++}
++
++uint32_t AudioHaptics::Rate() {
++    // Default 4 kHz. A report carries 31 samples, so at 8 kHz one is due every
++    // 3875 us - but a write to the puck takes 4000 us waiting for its radio
++    // slot, so 8 kHz can never be sustained there and the shortfall is felt as
++    // stutter. 4 kHz gives a 7750 us period, which the same write fills to 52%.
++    // Wired is different and its 16-bit mode is chosen separately.
++    return ReadSetting(L"HapticAudioRate", 4000, 8000) >= 6000 ? 8000u : 4000u;
++}
++
++size_t AudioHaptics::LatencyCap() {
++    const size_t cap = ReadSetting(L"HapticAudioLatency", 64, 128);
++    return cap < 4 ? 4 : cap;
++}
++
++void AudioHaptics::SendPcmMode(uint8_t op, uint8_t param) {
++    for (HidDevice& hid : m_actuators) {
++        if (!hid.IsOpen()) continue;
++        for (uint8_t side : {kSideLeft, kSideRight}) {
++            uint8_t report[64] = {};
++            report[0] = kReportPcmMode;
++            report[1] = op;
++            report[2] = side;
++            report[3] = param;
++            hid.WriteOutputReport(report, sizeof(report));
++        }
++    }
++}
++
++/**
++ * The USB interface number from a device path, or a large value when absent.
++ * Paths look like ...&mi_02&col03..., and that number is fixed by the device
++ * descriptor - unlike enumeration order, which is not sorted and differs
++ * between boots.
++ */
++static int InterfaceNumber(const std::wstring& path) {
++    const size_t at = path.find(L"&mi_");
++    if (at == std::wstring::npos) return 0xFF;
++    return static_cast<int>(wcstol(path.c_str() + at + 4, nullptr, 16));
++}
++
++bool AudioHaptics::OpenActuators() {
++    CloseActuators();
++
++    // Several vendor collections accept a stream report and only one is wired
++    // to the actuators, so acceptance alone is not a test. Measured on this
++    // hardware: four accept, and the one that moves the pad is the lowest
++    // interface number. Writing to all four instead costs 16 ms per report
++    // against a 3875 us period, because each write waits for its own radio
++    // slot - which is what made the stream stutter.
++    std::wstring bestPath;
++    int bestInterface = 0x100;
++    uint16_t bestPid = 0;
++
++    for (uint16_t pid : {kPidWired, kPidBluetooth, kPidPuck}) {
++        for (const std::wstring& path :
++             HidDevice::Enumerate(kValveVendor, pid, kVendorUsagePage)) {
++            HidDevice hid;
++            if (!hid.Open(path)) continue;
++            uint8_t probe[64] = {};
++            probe[0] = kReportStream;
++            const bool accepted = hid.WriteOutputReport(probe, sizeof(probe));
++            hid.Close();
++            if (!accepted) continue;
++            const int number = InterfaceNumber(path);
++            if (number < bestInterface) {
++                bestInterface = number;
++                bestPath = path;
++                bestPid = pid;
++            }
++        }
++    }
++
++    if (bestPath.empty()) return false;
++
++    HidDevice chosen;
++    if (!chosen.Open(bestPath)) return false;
++    if (bestPid == kPidWired) m_sixteenBit = true;
++    if (bestPid == kPidBluetooth) m_rate = 4000;
++    m_actuators.push_back(std::move(chosen));
++    return true;
++}
++
++void AudioHaptics::CloseActuators() {
++    for (HidDevice& hid : m_actuators) hid.Close();
++    m_actuators.clear();
++}
++
++bool AudioHaptics::Start() {
++    if (!Enabled()) return false;
++    if (m_running.exchange(true)) return true;
++
++    m_rate = Rate();
++    m_gain.store(Gain());
++    for (int b = 0; b < kBandCount; ++b) m_bands[b].store(BandGain(b));
++    m_rumbleGated.store(RumbleGated());
++    m_delayMs.store(DelayMs());
++    m_latency.store(LatencyCap());
++    if (!OpenActuators()) {
++        printf("AudioHaptics: no controller actuator interface answered.\n");
++        m_running.store(false);
++        return false;
++    }
++
++    // Disable first: the firmware refuses an enable on a channel already in PCM
++    // mode from a previous session that did not shut down cleanly.
++    const uint8_t param = m_sixteenBit ? 0 : static_cast<uint8_t>(m_rate == 8000 ? 8 : 9);
++    SendPcmMode(kPcmDisable, 0);
++    Sleep(10);
++    SendPcmMode(kPcmEnable, param);
++    Sleep(kPcmSettleMs);
++
++    m_interfaceCount.store(static_cast<int>(m_actuators.size()));
++    printf("AudioHaptics: PCM enabled on %u interface(s), %s @ %u Hz.\n",
++           static_cast<unsigned>(m_actuators.size()), m_sixteenBit ? "16-bit" : "u-law", m_rate);
++
++    m_capture = std::thread(&AudioHaptics::CaptureLoop, this);
++    m_sender  = std::thread(&AudioHaptics::SendLoop, this);
++    return true;
++}
++
++void AudioHaptics::Stop() {
++    if (!m_running.exchange(false)) return;
++    if (m_capture.joinable()) m_capture.join();
++    if (m_sender.joinable())  m_sender.join();
++    m_active.store(false, std::memory_order_relaxed);
++    m_interfaceCount.store(0);
++    // Hand the actuators back, or they stay in PCM mode and rumble stays dead.
++    SendPcmMode(kPcmDisable, 0);
++    Sleep(10);
++    CloseActuators();
++    {
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        m_queue.clear();
++    }
++}
++
++void AudioHaptics::SendLoop() {
++    // One report is exactly its sample count at the transport rate: 31 samples
++    // at 8 kHz is 3875 us. Holding that clock is the whole job - the actuators
++    // reproduce a waveform, so a late report is an audible gap, not a delay.
++    const auto period = std::chrono::microseconds(
++        m_sixteenBit ? 1875LL : static_cast<long long>(31'000'000ULL / m_rate));
++
++    // Windows' default timer resolution is about 15.6 ms. sleep_until on a
++    // 3.875 ms period therefore overshoots by whole timer ticks and the stream
++    // arrives in clumps, which is felt as stutter rather than as latency. Ask
++    // for 1 ms and spin the last stretch.
++    timeBeginPeriod(1);
++
++    // Prime before starting the clock. WASAPI hands over roughly 10 ms of audio
++    // at a time, so reports are produced in bursts of two or three; starting on
++    // the first one guarantees an underrun a few milliseconds later.
++    const size_t prime = 4;
++    while (m_running.load()) {
++        size_t queued = 0;
++        {
++            std::lock_guard<std::mutex> lock(m_queueMutex);
++            queued = m_queue.size();
++        }
++        if (queued >= prime) break;
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++
++    auto next = std::chrono::steady_clock::now();
++    while (m_running.load()) {
++        Report report{};
++        bool have = false;
++        {
++            std::lock_guard<std::mutex> lock(m_queueMutex);
++            if (!m_queue.empty()) {
++                report = m_queue.front();
++                m_queue.erase(m_queue.begin());
++                have = true;
++            }
++        }
++
++        if (have) {
++            for (HidDevice& hid : m_actuators) {
++                if (hid.IsOpen()) hid.WriteOutputReport(report.data(), report.size());
++            }
++        }
++        // The clock advances whether or not a report was ready. An underrun is
++        // one missing packet, not a reason to restart the cadence - resetting it
++        // on every gap is what turns a brief starve into permanent judder.
++        next += period;
++
++        const auto now = std::chrono::steady_clock::now();
++        if (now > next + period * 4) {
++            // Genuinely far behind: resynchronise rather than burst-send to
++            // catch up, which would flood the firmware.
++            next = now;
++            continue;
++        }
++        // Sleep the coarse part, spin the last millisecond. The spin is bounded
++        // by the period, so it costs well under 1% of a core at this rate.
++        const auto coarse = next - std::chrono::milliseconds(1);
++        if (std::chrono::steady_clock::now() < coarse) {
++            std::this_thread::sleep_until(coarse);
++        }
++        while (std::chrono::steady_clock::now() < next) {
++            YieldProcessor();
++        }
++    }
++
++    timeEndPeriod(1);
++}
++
++void AudioHaptics::CaptureLoop() {
++    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++    const bool ownsCom = SUCCEEDED(comInit);
++    while (m_running.load()) {
++        RunCaptureSession();
++        if (!m_running.load()) break;
++        m_active.store(false, std::memory_order_relaxed);
++        std::this_thread::sleep_for(kRetryDelay);
++    }
++    if (ownsCom) CoUninitialize();
++}
++
++void AudioHaptics::RunCaptureSession() {
++    IMMDeviceEnumerator* enumerator = nullptr;
++    IMMDevice*           endpoint   = nullptr;
++    IAudioClient*        client     = nullptr;
++    IAudioCaptureClient* capture    = nullptr;
++    WAVEFORMATEX*        format     = nullptr;
++
++    const auto release = [&]() {
++        if (capture)    capture->Release();
++        if (client)     client->Release();
++        if (endpoint)   endpoint->Release();
++        if (enumerator) enumerator->Release();
++        if (format)     CoTaskMemFree(format);
++    };
++
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
++                                __uuidof(IMMDeviceEnumerator),
++                                reinterpret_cast<void**>(&enumerator)))
++        || FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &endpoint))
++        || FAILED(endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
++                                     reinterpret_cast<void**>(&client)))
++        || FAILED(client->GetMixFormat(&format))) {
++        release();
++        return;
++    }
++
++    const bool extensible = format->wFormatTag == WAVE_FORMAT_EXTENSIBLE;
++    const bool isFloat =
++        format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT
++        || (extensible && format->cbSize >= 22
++            && reinterpret_cast<WAVEFORMATEXTENSIBLE*>(format)->SubFormat.Data1
++                   == WAVE_FORMAT_IEEE_FLOAT);
++    const bool isPcm16 = !isFloat && format->wBitsPerSample == 16;
++    if (!isFloat && !isPcm16) {
++        release();
++        return;
++    }
++
++    if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
++                                  100'000, 0, format, nullptr))
++        || FAILED(client->GetService(__uuidof(IAudioCaptureClient),
++                                     reinterpret_cast<void**>(&capture)))
++        || FAILED(client->Start())) {
++        release();
++        return;
++    }
++
++    const float    sampleRate = static_cast<float>(format->nSamplesPerSec);
++    const uint32_t channels   = format->nChannels == 0 ? 1u : format->nChannels;
++    // Decimation ratio to the transport rate. Anything above the transport's
++    // Nyquist has to go before decimating, or it aliases down into the band we
++    // can actually feel, which reads as grit rather than bass.
++    const float    ratio      = sampleRate / static_cast<float>(m_rate);
++    const float    antiAlias  = OnePole(static_cast<float>(m_rate) * 0.45f, sampleRate);
++    // One bank per channel. Q of 1.1 gives bands that overlap slightly, so a
++    // sweep across them is continuous rather than stepped.
++    Biquad leftBank[kBandCount];
++    Biquad rightBank[kBandCount];
++    for (int b = 0; b < kBandCount; ++b) {
++        leftBank[b].SetBandpass(kBandCentres[b], 1.1f, sampleRate);
++        rightBank[b].SetBandpass(kBandCentres[b], 1.1f, sampleRate);
++    }
++    const float releaseMs = RumbleReleaseMs();
++
++    // Delay line on the decimated stream. One second of headroom at 8 kHz is
++    // ample for the 500 ms ceiling and costs 32 KB.
++    const size_t delayCapacity = 8000;
++    std::vector<float> delayLeft(delayCapacity, 0.0f);
++    std::vector<float> delayRight(delayCapacity, 0.0f);
++    size_t delayWrite = 0;
++    // Read per sample below, not captured here, so a slider moves the feel now.
++    const size_t   perReport  = m_sixteenBit ? kPcm16SamplesPerReport : kMuLawSamplesPerReport;
++
++    float leftLp = 0.0f, rightLp = 0.0f;
++    float accumulator = 0.0f;
++    Report report{};
++    report[0] = kReportStream;
++    size_t filled = 0;
++
++    m_active.store(true, std::memory_order_relaxed);
++
++    while (m_running.load()) {
++        UINT32 packet = 0;
++        if (FAILED(capture->GetNextPacketSize(&packet))) break;
++        if (packet == 0) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(2));
++            continue;
++        }
++        BYTE*  data   = nullptr;
++        UINT32 frames = 0;
++        DWORD  flags  = 0;
++        if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
++        const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr;
++
++        for (UINT32 i = 0; i < frames; ++i) {
++            float left = 0.0f, right = 0.0f;
++            if (!silent) {
++                const size_t base = static_cast<size_t>(i) * channels;
++                if (isFloat) {
++                    const float* samples = reinterpret_cast<const float*>(data);
++                    left  = samples[base];
++                    right = channels > 1 ? samples[base + 1] : samples[base];
++                } else {
++                    const int16_t* samples = reinterpret_cast<const int16_t*>(data);
++                    left  = static_cast<float>(samples[base]) / 32768.0f;
++                    right = static_cast<float>(channels > 1 ? samples[base + 1] : samples[base])
++                            / 32768.0f;
++                }
++            }
++
++            // Graphic EQ: filter each band out on its own and sum them back
++            // with its own level. A band set to zero contributes nothing at all,
++            // which a shelf could never do.
++            float shapedLeft = 0.0f, shapedRight = 0.0f;
++            for (int b = 0; b < kBandCount; ++b) {
++                const float level = m_bands[b].load(std::memory_order_relaxed);
++                if (level <= 0.0f) {
++                    // Still run the filter: its state has to stay continuous or
++                    // re-enabling the band clicks.
++                    leftBank[b].Process(left);
++                    rightBank[b].Process(right);
++                    continue;
++                }
++                shapedLeft  += leftBank[b].Process(left) * level;
++                shapedRight += rightBank[b].Process(right) * level;
++            }
++            left  = shapedLeft;
++            right = shapedRight;
++
++            leftLp  += antiAlias * (left - leftLp);
++            rightLp += antiAlias * (right - rightLp);
++
++            accumulator += 1.0f;
++            if (accumulator < ratio) continue;
++            accumulator -= ratio;
++
++            // Delay the AUDIO, never the response.
++            //
++            // The delay line carries the raw band-shaped waveform and nothing
++            // else. Gain and the rumble gate are applied AFTER it, against the
++            // clock as it is now - so an impact opens the gate the instant the
++            // game asks, while the sound it lets through is the one that lines
++            // up with the speakers. Applying the gate before the line, as this
++            // did at first, delayed the response along with the audio and made
++            // every hit late by whatever the slider said.
++            delayLeft[delayWrite]  = leftLp;
++            delayRight[delayWrite] = rightLp;
++            size_t offset = static_cast<size_t>(m_delayMs.load(std::memory_order_relaxed)
++                                                * static_cast<float>(m_rate) / 1000.0f);
++            if (offset >= delayCapacity) offset = delayCapacity - 1;
++            const size_t readAt = (delayWrite + delayCapacity - offset) % delayCapacity;
++            const float delayedLeft  = delayLeft[readAt];
++            const float delayedRight = delayRight[readAt];
++            delayWrite = (delayWrite + 1) % delayCapacity;
++
++            float gain = m_gain.load(std::memory_order_relaxed);
++            if (m_rumbleGated.load(std::memory_order_relaxed)) {
++                // The game says WHEN, the audio says WHAT. Outside a rumble
++                // request the pad is silent, so ambient music no longer buzzes
++                // continuously; during one, the texture comes from the sound
++                // rather than from a motor byte.
++                const auto now = static_cast<long long>(GetTickCount64());
++                const long long since = now - m_rumbleAtMs.load(std::memory_order_relaxed);
++                const float level = m_rumbleLevel.load(std::memory_order_relaxed);
++                float envelope = 0.0f;
++                if (level > 0.0f && since >= 0) {
++                    envelope = 1.0f - static_cast<float>(since) / releaseMs;
++                    if (envelope < 0.0f) envelope = 0.0f;
++                    envelope *= level;
++                }
++                gain *= envelope;
++            }
++            const float l = SoftLimit(delayedLeft * gain);
++            const float r = SoftLimit(delayedRight * gain);
++            const auto li = static_cast<int16_t>(std::clamp(l, -1.0f, 1.0f) * 32767.0f);
++            const auto ri = static_cast<int16_t>(std::clamp(r, -1.0f, 1.0f) * 32767.0f);
++
++            if (m_sixteenBit) {
++                report[2 + filled * 2]  = static_cast<uint8_t>(li & 0xFF);
++                report[3 + filled * 2]  = static_cast<uint8_t>((li >> 8) & 0xFF);
++                report[33 + filled * 2] = static_cast<uint8_t>(ri & 0xFF);
++                report[34 + filled * 2] = static_cast<uint8_t>((ri >> 8) & 0xFF);
++            } else {
++                report[2 + filled]  = LinearToMuLaw(li);
++                report[33 + filled] = LinearToMuLaw(ri);
++            }
++            ++filled;
++
++            if (filled >= perReport) {
++                report[1] = static_cast<uint8_t>(m_sixteenBit ? 30 : perReport);
++                {
++                    std::lock_guard<std::mutex> lock(m_queueMutex);
++                    // Drop the oldest rather than grow: late haptics are worse
++                    // than missing ones, and an unbounded queue becomes delay.
++                    if (m_queue.size() >= m_latency.load(std::memory_order_relaxed))
++                        m_queue.erase(m_queue.begin());
++                    m_queue.push_back(report);
++                }
++                report = Report{};
++                report[0] = kReportStream;
++                filled = 0;
++            }
++        }
++        capture->ReleaseBuffer(frames);
++    }
++
++    m_active.store(false, std::memory_order_relaxed);
++    client->Stop();
++    release();
++}
++
++void AudioHaptics::Reload() {
++    // Gain, bass and latency are live: the capture loop reads them per sample,
++    // so a slider is felt before it is released.
++    m_gain.store(Gain(), std::memory_order_relaxed);
++    for (int b = 0; b < kBandCount; ++b)
++        m_bands[b].store(BandGain(b), std::memory_order_relaxed);
++    m_rumbleGated.store(RumbleGated(), std::memory_order_relaxed);
++    m_delayMs.store(DelayMs(), std::memory_order_relaxed);
++    m_latency.store(LatencyCap(), std::memory_order_relaxed);
++
++    // The enable flag and the transport rate are structural - they decide
++    // whether a stream exists at all and at what clock - so they restart it.
++    const bool wanted = Enabled();
++    const bool running = m_running.load();
++    if (wanted && running && Rate() != m_rate) {
++        Stop();
++        Start();
++        return;
++    }
++    if (wanted && !running) Start();
++    if (!wanted && running) Stop();
++}
+diff --git a/src/steam/AudioHaptics.h b/src/steam/AudioHaptics.h
+new file mode 100644
+index 0000000..a821da1
+--- /dev/null
++++ b/src/steam/AudioHaptics.h
+@@ -0,0 +1,135 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#include "../hid/HidDevice.h"
++
++// Streams system audio to the Steam Controller's haptic actuators as PCM, so
++// the actuators reproduce the sound rather than buzzing in time with it.
++//
++// Why not rumble: XInput carries two motor bytes and a game sends them on
++// discrete events. Driving those bytes from an audio envelope is still only an
++// intensity, and on voice-coil actuators it reads as a weak hum. The firmware
++// has a real path - a PCM mode on the two actuator channels - and that is what
++// the "music through a Steam Controller" demos use.
++//
++// Protocol credit: the report layout and timing below were established by
++// LiveHaptics (FamBoy32-dev/steam-controller-live-haptics, MIT) and
++// SteamHapticsPlayer (Pixel1011). This is an independent implementation of the
++// same documented protocol.
++//
++//   0x86  [0x86, op, side, param]   op 1 = disable, 2 = enable
++//                                   side 2 and 5 are the two actuators
++//                                   param 0 = 16-bit, 8 = 8 kHz u-law, 9 = 4 kHz
++//   0x88  64-byte report: [1] = sample count,
++//                         left channel at 2 + i, right at 33 + i (u-law)
++//   rate  one report every 31,000,000 / rate microseconds (3875 us at 8 kHz)
++//
++// While this is streaming, normal rumble is suppressed: both drive the same
++// actuators, and a motor command on top of a waveform produces neither.
++//
++// Scope: runs only while this process owns the controller. Inside a Steam game
++// Steam Input holds the device, which is the same exclusivity that shapes the
++// rest of this application.
++class AudioHaptics {
++public:
++    static AudioHaptics& Instance();
++
++    // Opens its own handles to the vendor interfaces, enables PCM mode and
++    // starts capture. False when disabled by settings or no controller answered.
++    bool Start();
++    void Stop();
++
++    // True while PCM is streaming. Rumble is suppressed for exactly this long.
++    bool Active() const { return m_active.load(std::memory_order_relaxed); }
++
++    // Re-reads every tunable from the registry and applies it live. Gain, bass
++    // and latency take effect on the next report; a change to the enable flag or
++    // the transport rate restarts the stream. The settings window calls this, so
++    // nothing there ever asks the user to restart the application.
++    void Reload();
++
++    // How many actuator interfaces accepted the stream probe. Zero while
++    // stopped, and the number the settings window reports.
++    int InterfaceCount() const { return m_interfaceCount.load(std::memory_order_relaxed); }
++
++    // --- settings, HKCU\Software\SteamlessController, re-read by Reload() ---
++
++    // HapticAudioMode: 0 = off (default), 1 = stream audio to the actuators.
++    static bool Enabled();
++    // HapticAudioGain: loudness in percent. Default 854, up to 2000.
++    static float Gain();
++    // HapticEqBandN: per-band level in percent, 0 removes the band entirely.
++    // Six bands centred at 30, 60, 120, 240, 480 and 960 Hz - the range the
++    // actuators can actually reproduce, not the range a speaker can.
++    static constexpr int kBandCount = 6;
++    static float BandGain(int band);
++
++    // HapticRumbleGate: 0 = always stream, 1 = only while the game is asking
++    // for rumble (default). On, audio supplies the texture and the game supplies
++    // the timing, so ambient music does not buzz the pad all the time.
++    static bool RumbleGated();
++    // HapticRumbleRelease: milliseconds the gate takes to fall. Default 220.
++    static float RumbleReleaseMs();
++
++    // HapticAudioDelayMs: hold the haptics back to line up with the speakers.
++    // Loopback taps the stream before the endpoint buffer and the DAC, so the
++    // pad is genuinely ahead of what you hear. Default 68, up to 500.
++    static float DelayMs();
++
++    // Called from the rumble path with the requested motor level, 0..1. Ignored
++    // unless gating is on.
++    void SetRumbleLevel(float level);
++    // HapticAudioRate: 8000 or 4000. Default 4000.
++    static uint32_t Rate();
++    // HapticAudioLatency: queued reports before the oldest is dropped. Default 64.
++    static size_t LatencyCap();
++
++private:
++    AudioHaptics() = default;
++    ~AudioHaptics();
++    AudioHaptics(const AudioHaptics&)            = delete;
++    AudioHaptics& operator=(const AudioHaptics&) = delete;
++
++    // One 64-byte 0x88 report.
++    using Report = std::array<uint8_t, 64>;
++
++    bool OpenActuators();
++    void CloseActuators();
++    // op 1 disables, op 2 enables; sent to both actuator channels.
++    void SendPcmMode(uint8_t op, uint8_t param);
++
++    void CaptureLoop();   // WASAPI loopback -> DSP -> decimate -> u-law -> queue
++    void SendLoop();      // drains the queue onto the wire at the sample clock
++    void RunCaptureSession();
++
++    std::vector<HidDevice> m_actuators;
++
++    std::thread       m_capture;
++    std::thread       m_sender;
++    std::atomic<bool> m_running{false};
++    std::atomic<bool> m_active{false};
++    // The wired controller (pid 0x1302) carries 16-bit instead of u-law.
++    bool              m_sixteenBit{false};
++    uint32_t          m_rate{8000};
++
++    // Read live by the capture loop so the settings window takes effect at once.
++    std::atomic<float>  m_gain{2.0f};
++    std::atomic<float>  m_delayMs{0.0f};
++    std::atomic<float>  m_bands[kBandCount]{};
++    std::atomic<bool>   m_rumbleGated{false};
++    // Latest rumble request and when it arrived, so the gate can fall smoothly
++    // rather than cutting the waveform off mid-cycle.
++    std::atomic<float>  m_rumbleLevel{0.0f};
++    std::atomic<long long> m_rumbleAtMs{0};
++    std::atomic<size_t> m_latency{16};
++    std::atomic<int>    m_interfaceCount{0};
++
++    std::mutex          m_queueMutex;
++    std::vector<Report> m_queue;
++};
+diff --git a/src/steam/SteamController.cpp b/src/steam/SteamController.cpp
+index b82ebe6..c51023c 100644
+--- a/src/steam/SteamController.cpp
++++ b/src/steam/SteamController.cpp
+@@ -1,4 +1,5 @@
+ #include "SteamController.h"
++#include "AudioHaptics.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+@@ -135,6 +136,7 @@ bool SteamController::AdoptHandle(void* handle, const std::wstring& path) {
+ void SteamController::Close() {
+     if (m_running.exchange(false) && m_rumbleThread.joinable())
+         m_rumbleThread.join();
++    AudioHaptics::Instance().Stop();
+     ClearTrackpadHaptics();
+     SetRumble(0, 0);
+     m_device.Close();
+@@ -229,8 +231,12 @@ bool SteamController::DisableLizardMode() {
+         }
+     }
+ 
+-    if (!m_running.exchange(true))
++    if (!m_running.exchange(true)) {
+         m_rumbleThread = std::thread(&SteamController::RumbleLoop, this);
++        // Only meaningful while this process owns the pad, so it shares the
++        // rumble thread's lifetime exactly. No-ops unless HapticAudioMode is on.
++        AudioHaptics::Instance().Start();
++    }
+ 
+     return true;
+ }
+@@ -262,6 +268,7 @@ void SteamController::EmergencyLizardRestore() noexcept {
+ bool SteamController::EnableLizardMode() {
+     if (m_running.exchange(false) && m_rumbleThread.joinable())
+         m_rumbleThread.join();
++    AudioHaptics::Instance().Stop();
+ 
+     ClearTrackpadHaptics();
+     SetRumble(0, 0);
+@@ -326,6 +333,14 @@ void SteamController::SetRumble(uint8_t largeMotor, uint8_t smallMotor) {
+     const double low  = MotorByteToUnit(largeMotor);
+     const double high = MotorByteToUnit(smallMotor);
+ 
++    // Every rumble request is reported to the haptics engine, whether or not it
++    // is gating on them. The game is the only thing that knows when something
++    // worth feeling happened - audio knows what it sounded like, not whether it
++    // was aimed at the player. Gating on this is what separates an explosion
++    // from the soundtrack.
++    AudioHaptics::Instance().SetRumbleLevel(
++        static_cast<float>(low > high ? low : high));
++
+     const double leftDemand  = ClampUnit(low * 1.00 + high * 0.30);
+     const double rightDemand = ClampUnit(low * 0.78 + high * 0.88);
+     const uint16_t baseLeft  = UnitToHapticSpeed(leftDemand,  0x1200);
+@@ -447,6 +462,19 @@ void SteamController::ClearTrackpadHaptics() {
+ bool SteamController::SendRumbleOutput(uint16_t leftSpeed, uint16_t rightSpeed) {
+     if (!m_device.IsOpen()) return false;
+ 
++    // PCM audio haptics own the actuators while streaming, so every rumble
++    // write is dropped here rather than at each call site. There were two call
++    // sites - the rumble thread and SetRumble's own immediate write - and
++    // gating only the first left game rumble fully audible. This is the one
++    // function that puts a motor command on the wire, so gating it is the only
++    // version that a new caller cannot quietly bypass.
++    //
++    // A stop still goes through: it is how the motors are silenced on the way
++    // into PCM mode, and silencing them must never be the thing that is blocked.
++    if ((leftSpeed != 0 || rightSpeed != 0) && AudioHaptics::Instance().Active()) {
++        return true;
++    }
++
+     uint8_t buf[10] = {};
+     buf[0] = OUT_HAPTIC_RUMBLE;
+     buf[1] = 0x00;
+@@ -496,7 +524,26 @@ bool SteamController::SendTrackpadCommandOutput(uint8_t side, uint8_t command, i
+ // ---------------------------------------------------------------------------
+ 
+ void SteamController::RumbleLoop() {
++    // True while the previous pass suppressed rumble, so the motors are stopped
++    // exactly once on the way into PCM mode rather than every pass.
++    bool suppressed = false;
++
+     while (m_running.load()) {
++        // PCM audio haptics drive the same two actuators. A rumble command on
++        // top of a waveform produces neither, so rumble is suppressed outright
++        // for as long as audio is streaming - this is the "disable normal
++        // rumble" half of the feature, and it is enforced here rather than by
++        // asking every caller to check.
++        if (AudioHaptics::Instance().Active()) {
++            if (!suppressed) {
++                SendRumbleOutput(0, 0);
++                suppressed = true;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(40));
++            continue;
++        }
++        suppressed = false;
++
+         RumbleFrame frame{};
+         {
+             std::lock_guard<std::mutex> lock(m_rumbleMutex);
+diff --git a/src/steam/SteamController.h b/src/steam/SteamController.h
+index c254aa2..2aa4ff8 100644
+--- a/src/steam/SteamController.h
++++ b/src/steam/SteamController.h
+@@ -84,7 +84,12 @@ public:
+     static constexpr uint8_t BTN_B        = 0x02;  // bit 1
+     static constexpr uint8_t BTN_X        = 0x04;  // bit 2
+     static constexpr uint8_t BTN_Y        = 0x08;  // bit 3
+-    // bit 4 (0x10): TBD
++    // bit 4 — the "..." button between the trackpads, SteamOS's Quick Access
++    // Menu. Identified 2026-09-21 by logging undecoded bits and pressing it:
++    // eleven clean 0x10 press/release pairs, no other bit moving. It had been
++    // reporting correctly all along with nothing listening, so the button did
++    // nothing at all.
++    static constexpr uint8_t BTN_QUICK_ACCESS = 0x10;
+     static constexpr uint8_t BTN_RS       = 0x20;  // bit 5 — right stick click
+     static constexpr uint8_t BTN_MENU     = 0x40;  // bit 6 — ≡ Menu / Start
+     static constexpr uint8_t BTN_R4       = 0x80;  // bit 7 — back paddle R4

@@ -115,7 +115,7 @@ Delay       68 ms     Buffer  64       Rate  4 kHz  Gate  on
 ```
 
 Tuned by hand on real hardware, not derived. Every value is set from the **Audio Haptics** tab
-of the settings window and applies live.
+of the Customize Controls window and applies live.
 
 **Off until you turn it on**, because it replaces the game's own rumble.
 
@@ -133,22 +133,28 @@ haptics not working. To feel it on anything, untick *Only while the game asks fo
 
 ## Files
 
-| | |
-|---|---|
-All of it ships in one patch,
-[`steamlesscontroller-patches/steamlesscontroller-1.17.patch`](../steamlesscontroller-patches/steamlesscontroller-1.17.patch):
+All of it ships in one patch against SteamlessController 1.24,
+[`steamlesscontroller-patches/steamlesscontroller-1.24.patch`](../steamlesscontroller-patches/steamlesscontroller-1.24.patch),
+and on the fork's [`additions-1.24`](https://github.com/Kaaaaarrrll/SteamlessController/tree/additions-1.24)
+branch:
 
 | | |
 |---|---|
 | `src/steam/AudioHaptics.{h,cpp}` | capture, DSP, transport, rumble gate |
-| `src/app/RemapWindow.cpp` | the **Audio Haptics** tab of the settings window (live, no restart) |
+| `src/app/RemapWindow.cpp` | the **Audio Haptics** tab of the Customize Controls window (live, no restart) |
 | `src/steam/SteamController.cpp` | the rumble gate at `SendRumbleOutput`, rumble level reporting |
 | `src/probe/AudioHapticsProbe.cpp` | identifies the working interface and measures the transport |
 
+`AudioHaptics.{h,cpp}` find the controller themselves and need only Windows and upstream's small
+`src/hid/HidDevice.{h,cpp}` wrapper, so those four files can be lifted into another project on
+their own. Anyone may use them, or any of this code, in
+their own projects with no need to fork or branch from here. It is MIT licensed: keep the licence
+notice with a substantial copy.
+
 ## Building
 
-See [`steamlesscontroller-patches/README.md`](../steamlesscontroller-patches/README.md) — apply
-the patch to SteamlessController 1.17 and build. Verified to apply and build on a pristine
+See [`steamlesscontroller-patches/README.md`](../steamlesscontroller-patches/README.md): apply
+the patch to SteamlessController 1.24 and build. Verified to apply and build on a pristine
 checkout.
 
 ## The probe

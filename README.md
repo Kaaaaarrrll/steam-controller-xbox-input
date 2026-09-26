@@ -97,14 +97,14 @@ Xbox mode on startup**.
 | **Popup: "Driver required" or "Xbox controller driver missing"** — and the Steam button, the "..." button and the paddles all stopped working | **ViGEmBus is gone** — most often removed by uninstalling an app that had installed it: Apollo, Sunshine, DS4Windows and others. SteamlessController's event log shows `vigem_connect ... driverMissing=1`. Reinstall **ViGEmBus 1.22.0** from [its releases page](https://github.com/nefarius/ViGEmBus/releases/latest) (the final release; the project is retired). The bridge retries every 30 seconds and picks it up without a restart. Installed on its own, it no longer belongs to the other app. |
 | **Controller is dead after a restart until you click the tray icon** | SteamlessController is on Manual. Set it to **"Off while Steam is running"** — the manual switch is never saved. |
 | **The Xbox app ignores the controller right after boot** | Either Steam started with Windows (see the first row), or the dongle appeared after the bridge started — unplug and replug it. `-SelfTest` (below) shows `ControllerPresent: False` in that case. |
-| **A trackpad click turns into a click-and-drag** | Use the patched build, which freezes the pointer while the pad is pressed. Still dragging? Lower `PadPressArea` (try `1100`) and restart the bridge. |
+| **A trackpad click turns into a click-and-drag** | Use the patched build, which holds the pointer still while the pad is pressed and for 120 ms after. |
 | **The "..." button does nothing** | Standard SteamlessController never reads that button. The patched build makes it open the touch keyboard. |
 | **The on-screen keyboard appears but its keys can't be clicked with the trackpad** | That is `osk.exe`, which runs with higher privileges, so Windows discards clicks aimed at it. Use the **touch** keyboard instead — the "..." button in the patched build, or the Touch Keyboard binding. |
 | **The trackpad mouse stops working over some windows** | The bridge isn't running with administrator rights. Make sure the background task starts it, not its own "Start with Windows". |
 | **A Steam game starts but Steam doesn't see the controller** | The bridge let go a moment too late. Press the Steam button, or unplug and replug the dongle. |
-| **Scrolling does nothing in the Xbox app** | Almost certainly the cursor, not the scroll — see *cursor warp* under the patched build. |
-| **Scrolling in the Xbox app flies down the page** | One notch there is a whole row of content. Raise `XboxScrollDivisor`. |
-| **Every patched feature stops at once** — haptics, the "..." button, momentum, scroll fixes | A SteamlessController update replaced the patched program. Rebuild and copy it back. |
+| **Scrolling does nothing in the Xbox app** | The wheel scrolls whatever is under the pointer, not the selected item. Move the pointer over the content first. |
+| **Scrolling in the Xbox app flies down the page** | One notch there is a whole row of content. Lower **Scroll Speed** for that pad in Customize Controls. |
+| **Every patched feature stops at once**: haptics, the "..." button, click without drag | A SteamlessController update replaced the patched program. Rebuild and copy it back. |
 | **Everything is dead** | The controller falls back to lizard mode, where the right trackpad is a mouse — you can always click your way out. |
 | **A controller firmware update breaks the bridge** | It has happened once (SteamlessController #40). Update SteamlessController before assuming this setup is at fault. |
 
@@ -199,7 +199,8 @@ Value meanings, decoded from the MIT source because none of it is documented:
 - **buttons / pad clicks** — `A=0 B=1 X=2 Y=3 LB=4 RB=5 LT=6 RT=7 DPadUp=8 DPadDown=9
   DPadLeft=10 DPadRight=11 LeftMouseButton=12 RightMouseButton=13 None=14 Menu=15 View=16
   L3=17 R3=18 TouchKeyboard=19`
-- **pad mode** — `None=0 MousePointer=1 ScrollWheel=2 DS4Touchpad=3`
+- **pad mode** — `None=0 MousePointer=1 ScrollWheel=2 DS4Touchpad=3 DirectionalPad=4
+  SingleButton=5`
 - **scroll direction** — `Natural=0 Reversed=1`
 - **emulated platform** — `Xbox=0 PlayStation=1`
 - **auto mode** — `Manual=0 OffWhileSteam=1 OffOnlyInGame=2 OffUnlessProfile=3` — use `1`
@@ -247,57 +248,38 @@ restart the task.
 `KeepSteamAutostartOff` belonged to the old Steam-closing behaviour and are gone. Left in an old
 `config.json`, they are ignored.
 
-Trackpad feel is set in the registry under `HKCU\Software\SteamlessController`, applies only to
-the patched build, and is read **once at bridge startup**. The full list is in
-[`steamlesscontroller-patches/README.md`](steamlesscontroller-patches/README.md#settings); the
-ones worth knowing:
-
-| Value | Default | What it does |
-|---|---|---|
-| `PadPressArea` | `1400` | Contact area at which the pointer freezes for a click. Lower it if clicks still drag. |
-| `PadMomentumMs` | `300` | Coast time after a flick. `0` turns coasting off. |
-| `XboxScrollDivisor` | `6` | Divides scrolling while the Xbox app is in front. `1` restores standard behaviour. |
+Trackpad feel (pointer, scroll wheel, scroll speed, directional pad) is set in SteamlessController's
+own **Customize Controls** window.
 
 ## Optional: the patched SteamlessController
 
-Everything above works with standard SteamlessController. The patched build adds the following,
-**none of which are in upstream SteamlessController as of 1.24** (checked against its source):
+Everything above works with standard SteamlessController. The patched build is **the current
+upstream release, 1.24, with a few additions**. It only adds: new files and small hooks, with
+upstream's own code left as it is. None of these are in upstream as of 1.24:
 
-- **Audio haptics** — your system audio played through the trackpad actuators, optionally
+- **Audio haptics**: your system audio played through the trackpad actuators, optionally
   replacing game rumble, with an EQ, a delay to sync with your speakers, and a gate that lets it
-  through only when the game asks for rumble. See [below](#audio-haptics).
+  through only when the game asks for rumble. Set from a new **Audio Haptics** tab in Customize
+  Controls. See [below](#audio-haptics).
 - **The "..." (Quick Access) button toggles the Windows touch keyboard.** It's bit `0x10` of
-  report byte 2, which standard SteamlessController never reads — so there, the button does
+  report byte 2, which standard SteamlessController never reads, so there the button does
   nothing at all.
 - **Trackpad clicks no longer turn into drags.** Pressing hard enough to click rolls the
-  fingertip; the pointer now freezes while the pad is pressed, triggered by contact area, which
-  rises *before* the click registers.
-- **Flick-to-coast** on both pads, from a least-squares velocity fit rather than a two-sample
-  difference — which feels chaotic, because one unit of jitter over a 4 ms report gap is
-  250 units/s of noise.
-- **Scroll scaling and cursor warp for the Xbox app**, where one wheel notch is a whole row of
-  content and the wheel goes to whatever is under the cursor rather than the focused window.
-- **One settings window** with Controls and Audio Haptics tabs, and a **clearer popup** when
-  ViGEmBus goes missing.
+  fingertip. The pointer now holds still while the pad is pressed, and for 120 ms after.
+- **A clearer popup** when ViGEmBus goes missing.
 
-It also sends only **whole wheel notches** when scrolling, because the Xbox app's WinUI surfaces
-shiver in place on fractional ones.
+Two ways to get it. They're the same change:
 
-Two ways to get it — they're the same change:
+- **The fork**: [github.com/Kaaaaarrrll/SteamlessController](https://github.com/Kaaaaarrrll/SteamlessController),
+  branch `additions-1.24` (the default). Clone and build.
+- **The patch**: [`steamlesscontroller-patches/steamlesscontroller-1.24.patch`](steamlesscontroller-patches/),
+  to apply to SteamlessController 1.24 yourself. Verified to apply and build on a clean checkout.
 
-- **The fork** — [github.com/Kaaaaarrrll/SteamlessController](https://github.com/Kaaaaarrrll/SteamlessController),
-  branch `patched-1.17`: SteamlessController 1.17 with the changes already applied. Clone and
-  build.
-- **The patch** — [`steamlesscontroller-patches/steamlesscontroller-1.17.patch`](steamlesscontroller-patches/),
-  to apply to SteamlessController 1.17 yourself. Verified to apply and build on a clean checkout.
-
-Build instructions, every setting, and the reasoning behind each change:
+Build instructions and the details of each change:
 [`steamlesscontroller-patches/README.md`](steamlesscontroller-patches/README.md).
 
-> **Based on SteamlessController 1.17.** Upstream is now at 1.24 and has improvements this build
-> lacks — tap-to-click, press detection that catches clicks the firmware misses, and signed
-> releases among them. And **a SteamlessController update silently replaces the patched
-> program** — everything reverts to standard with no error.
+> **A SteamlessController update silently replaces the patched program.** Everything reverts to
+> standard with no error. Rebuild and copy it back.
 
 ## Audio haptics
 
@@ -323,11 +305,15 @@ waits for the radio slot — are in [`docs/audio-haptics.md`](docs/audio-haptics
 - This depends on a third-party tool. It is MIT-licensed and actively developed; if it ever stops
   being maintained, the SDL driver source documents the protocol well enough to rebuild the
   bridge.
-- The patched build is based on SteamlessController 1.17; upstream is at 1.24.
 
 ## Credits and licence
 
 This repository is MIT-licensed — see [LICENSE](LICENSE).
+
+**Use any of it, anywhere.** Anyone may use any of the code here or in the fork in any of their
+own projects: copy one function, one file, or all of it. There is no need to fork this
+repository or branch from it, and no need to ask. Keep the licence notice with a substantial
+copy.
 
 It installs and configures, but does not include, these projects:
 
@@ -346,8 +332,8 @@ respective owners.
 Issues and pull requests welcome. Particularly useful:
 
 - Testing on other Windows builds and Steam Controller firmware revisions
-- Porting the patch to current SteamlessController (1.24), and upstreaming the parts that belong
-  there — decoding the "..." button is a small, self-contained start
+- Upstreaming the parts that belong in SteamlessController itself. Decoding the "..." button is
+  a small, self-contained start
 - Handover edge cases the watchdog gets wrong — attach
   `%LOCALAPPDATA%\SteamPadBridge\logs\watchdog.log`
 
