@@ -1,0 +1,2344 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bb971d6..3771641 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,9 +10,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ add_library(SteamController STATIC
+     src/hid/HidDevice.cpp
+     src/steam/SteamController.cpp
++    src/steam/AudioHaptics.cpp
+ )
+ target_include_directories(SteamController PUBLIC src)
+-target_link_libraries(SteamController PUBLIC hid setupapi)
++target_link_libraries(SteamController PUBLIC hid setupapi ole32 winmm)
+ if (MSVC)
+     target_compile_options(SteamController PRIVATE /W4 /WX /utf-8)
+ endif()
+@@ -171,6 +172,7 @@ target_include_directories(SteamlessController PRIVATE
+     ${webview2_SOURCE_DIR}/build/native/include
+ )
+ target_link_libraries(SteamlessController PRIVATE
++    comctl32
+     SteamController
+     ViGEmClient
+     ${webview2_SOURCE_DIR}/build/native/${WV2_ARCH}/WebView2LoaderStatic.lib
+@@ -184,3 +186,13 @@ target_link_libraries(SteamlessController PRIVATE
+ if (MSVC)
+     target_compile_options(SteamlessController PRIVATE /W4 /WX /utf-8 /wd4828)
+ endif()
++
++# Standalone check of the audio-haptics capture path, because AudioHaptics runs
++# inside an elevated process where its failures cannot be observed.
++add_executable(AudioHapticsProbe
++    src/probe/AudioHapticsProbe.cpp
++)
++target_link_libraries(AudioHapticsProbe PRIVATE SteamController ole32 winmm hid)
++if (MSVC)
++    target_compile_options(AudioHapticsProbe PRIVATE /W4 /utf-8)
++endif()
+diff --git a/src/app/ControllerManager.cpp b/src/app/ControllerManager.cpp
+index e83c2c9..e576e25 100644
+--- a/src/app/ControllerManager.cpp
++++ b/src/app/ControllerManager.cpp
+@@ -939,6 +939,52 @@ void ControllerManager::ReadLoop(Slot* slot) {
+         // the click used to be hardcoded to a left button and only fired while
+         // that pad was driving the mouse.
+         if (hasPrev) {
++            // Four bits in the report are undecoded — buf[2] 0x10 and buf[5]
++            // 0x08/0x40/0x80 — and the button between the trackpads appears
++            // nowhere in the decoded map, so it is almost certainly one of
++            // them. Nothing reads those bits, which is why that button
++            // currently does nothing at all. Log a transition so it can be
++            // identified from the event log rather than guessed at: press the
++            // button, read the line.
++            //
++            // Free in the steady state: it writes only on a change, and by
++            // definition these bits do not move during ordinary play.
++            if (n > 5) {
++                // 0x10 is no longer unknown - it is the Quick Access button,
++                // named above. Three bits in the flags byte still are.
++                constexpr uint8_t kNamed2 = 0xFF;  // A B X Y, Quick Access, RS, Menu, R4
++                constexpr uint8_t kNamed5 = 0x37;  // LS touch, both pads, both grips
++                const uint8_t moved2 = static_cast<uint8_t>((buf[2] ^ prevBuf[2]) & ~kNamed2);
++                const uint8_t moved5 = static_cast<uint8_t>((buf[5] ^ prevBuf[5]) & ~kNamed5);
++                if (moved2 != 0 || moved5 != 0) {
++                    EventLog::Write("UNKNOWNBIT: buf[2]=0x%02X moved 0x%02X | "
++                                    "buf[5]=0x%02X moved 0x%02X",
++                                    buf[2], moved2, buf[5], moved5);
++                }
++            }
++
++            // The "..." button between the pads toggles the Windows touch
++            // keyboard: press to show, press again to hide. Toggle() is already
++            // a toggle and already hands the cross-process call to a worker, so
++            // this stays off the report loop.
++            //
++            // Hard-wired rather than a rebindable row on purpose, for now. A
++            // binding is plumbed through seven files, two of which are being
++            // deleted in the strip-down; this becomes a proper row on the far
++            // side of that, and the button does something useful in the
++            // meantime instead of nothing.
++            //
++            // Edge-detected on the press, so holding it does not flap the
++            // keyboard open and shut at report rate.
++            if (n > 2) {
++                const bool qaNow  = (buf[2]     & SteamController::BTN_QUICK_ACCESS) != 0;
++                const bool qaWas  = (prevBuf[2] & SteamController::BTN_QUICK_ACCESS) != 0;
++                if (qaNow && !qaWas) {
++                    EventLog::Write("QUICKACCESS: toggling the touch keyboard");
++                    TouchKeyboard::Toggle();
++                }
++            }
++
+             // A pad set to feed the DS4 touchpad has no click binding to
+             // dispatch — its press is the touchpad press. EffectiveClick
+             // returns nothing in that case, so a binding left behind by an
+diff --git a/src/app/RemapWindow.cpp b/src/app/RemapWindow.cpp
+index 3eb57ac..a01b8ef 100644
+--- a/src/app/RemapWindow.cpp
++++ b/src/app/RemapWindow.cpp
+@@ -1,4 +1,6 @@
+ #include "RemapWindow.h"
++
++#include "../steam/AudioHaptics.h"
+ #include "KeyInput.h"
+ #include "ControllerManager.h"
+ #include <shellapi.h>
+@@ -35,6 +37,7 @@ html,body{margin:0;padding:0;height:100%;overflow:hidden;}
+ body{font-family:'Barlow',system-ui,sans-serif;background:linear-gradient(180deg,#1b2838 0%,#15202c 100%);color:#fff;display:flex;flex-direction:column;height:100%;}
+ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;background:none;}
+ @keyframes scPulse{0%,100%{opacity:.4;transform:scale(.85);}50%{opacity:1;transform:scale(1.2);}}
++/* height is mirrored by WM_NCHITTEST's MulDiv(46, dpi, 96) - change both */
+ #titlebar{height:46px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 6px 0 14px;background:#171a21;border-bottom:1px solid rgba(0,0,0,.5);user-select:none;}
+ #titlebar .left{display:flex;align-items:center;gap:10px;}
+ .glyph{width:20px;height:20px;border-radius:5px;background:linear-gradient(135deg,#1a9fff,#0a4a78);display:flex;align-items:center;justify-content:center;box-shadow:0 0 8px rgba(26,159,255,.4);flex:none;}
+@@ -45,20 +48,22 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+ .winctl{width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:4px;color:#8f98a0;font-size:13px;cursor:pointer;transition:background .15s,color .15s;}
+ .winctl:hover{background:rgba(255,255,255,.08);}
+ .winctl.close:hover{background:#c0392b;color:#fff;}
+-#body{flex:1;display:flex;flex-direction:column;padding:24px 26px;gap:22px;overflow-y:auto;min-height:0;}
++#body{flex:1;display:flex;flex-direction:column;padding:10px 16px;gap:7px;overflow-y:auto;min-height:0;}
+ #body h2{font-size:21px;font-weight:800;color:#fff;letter-spacing:-.2px;}
+-.instr{font-size:13.5px;color:#8f98a0;line-height:1.5;margin-top:4px;}
++.instr{font-size:13.5px;color:#8f98a0;line-height:1.5;margin:2px 0 8px;}
+ .instr b{color:#66c0f4;font-weight:700;}
+-.group{display:flex;flex-direction:column;gap:11px;}
+-.group-label{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#5c6b78;font-weight:600;}
+-.row{display:flex;flex-direction:column;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:12px 16px;transition:border-color .2s,box-shadow .2s,background .2s;}
++.group{display:flex;flex-direction:column;gap:3px;}
++.pair{display:grid;grid-template-columns:1fr 1fr;gap:7px 12px;align-items:start;}
++@media (max-width:820px){.pair{grid-template-columns:1fr;}}
++.group-label{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:1.2px;color:#5c6b78;font-weight:600;line-height:1.1;}
++.row{display:flex;flex-direction:column;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:5px;padding:4px 10px;transition:border-color .2s,box-shadow .2s,background .2s;}
+ .row.listening{background:rgba(255,255,255,.05);border-color:#66c0f4;box-shadow:0 0 0 1px rgba(102,192,244,.4),0 10px 26px rgba(0,0,0,.32);}
+ .row.flash{border-color:#5ba32b;box-shadow:0 0 0 1px rgba(91,163,43,.4);}
+-.row-top{display:flex;align-items:center;gap:16px;}
+-.badge{width:46px;height:46px;flex:none;border-radius:10px;background:#1b2a3a;border:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;align-items:center;justify-content:center;}
++.row-top{display:flex;align-items:center;gap:12px;min-width:0;}
++.badge{width:38px;height:38px;flex:none;border-radius:10px;background:#1b2a3a;border:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;align-items:center;justify-content:center;}
+ .badge-id{font-size:15px;font-weight:800;color:#fff;line-height:1;}
+ .badge-pos{font-family:'JetBrains Mono',monospace;font-size:8px;color:#5c6b78;letter-spacing:.5px;margin-top:2px;}
+-.pos-label{font-size:13.5px;color:#aeb9c2;font-weight:500;flex:none;}
++.pos-label{font-size:13.5px;color:#aeb9c2;font-weight:500;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+ .inherit-row{display:flex;align-items:center;gap:10px;padding:14px 0 0 0;}
+ .inherit-row input{width:16px;height:16px;accent-color:#4a9eff;cursor:pointer;flex:none;margin:0;}
+ .inherit-row label{font-size:13.5px;color:#aeb9c2;font-weight:500;cursor:pointer;}
+@@ -81,7 +86,7 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+ .btn-row-reset{padding:6px 12px;border-radius:5px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:#8f98a0;font-size:12px;font-weight:600;transition:border-color .15s,color .15s,background .15s;}
+ .btn-row-reset:hover{border-color:#66c0f4;color:#66c0f4;background:rgba(102,192,244,.06);}
+ .combo-wrap{position:relative;}
+-.combo-toggle{width:100%;background:#101925;border:1px solid rgba(255,255,255,.12);border-radius:6px;color:#fff;font-size:13.5px;font-family:'Barlow',system-ui,sans-serif;padding:9px 12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px;}
++.combo-toggle{width:100%;background:#101925;border:1px solid rgba(255,255,255,.12);border-radius:6px;color:#fff;font-size:13.5px;font-family:'Barlow',system-ui,sans-serif;padding:7px 12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px;}
+ .combo-toggle:hover{border-color:#66c0f4;}
+ .combo-toggle .chev{color:#5c6b78;font-size:11px;flex:none;}
+ .combo-panel{position:absolute;top:calc(100% + 6px);left:0;right:0;background:#101925;border:1px solid rgba(102,192,244,.3);border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.45);padding:10px;z-index:20;}
+@@ -93,7 +98,7 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+ .combo-item:hover{background:rgba(102,192,244,.12);color:#fff;}
+ .combo-item.active{background:rgba(102,192,244,.18);color:#fff;}
+ .combo-empty{padding:10px;font-size:12px;color:#5c6b78;text-align:center;}
+-.mode-row{padding-top:14px;padding-bottom:14px;}
++.mode-row{padding-top:8px;padding-bottom:8px;}
+ .mode-select{background:#101925;border:1px solid rgba(255,255,255,.12);border-radius:6px;color:#fff;font-size:13px;font-family:'Barlow',system-ui,sans-serif;padding:7px 10px;font-weight:600;cursor:pointer;flex:none;min-width:215px;}
+ .mode-select:hover{border-color:#66c0f4;}
+ .mode-select:focus{outline:none;border-color:#66c0f4;}
+@@ -110,7 +115,7 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+ .mod-pill.on{border-color:#66c0f4;background:rgba(102,192,244,.18);color:#fff;}
+ .mod-note{font-size:11.5px;color:#5c6b78;line-height:1.45;margin-top:9px;}
+ .mod-note b{color:#8f98a0;font-weight:700;}
+-#footer{height:62px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:#15202c;border-top:1px solid rgba(0,0,0,.45);}
++#footer{height:50px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:#15202c;border-top:1px solid rgba(0,0,0,.45);}
+ .footer-right{display:flex;gap:10px;align-items:center;}
+ .btn-reset{padding:9px 16px;border-radius:3px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:#aeb9c2;font-weight:600;font-size:13.5px;transition:color .15s;}
+ .btn-reset:hover{color:#fff;}
+@@ -136,6 +141,27 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+ .btn-delete:hover{opacity:.9;}
+ .btn-save{padding:8px 18px;border-radius:4px;border:1px solid #4c7a1d;background:linear-gradient(to bottom,#94c63d,#5d8a1f);color:#13260a;font-weight:700;font-size:13px;}
+ .btn-save:hover{opacity:.9;}
++/* --- tabs and the haptics page -------------------------------------- */
++#tabs{display:flex;gap:2px;padding:0 20px;border-bottom:1px solid rgba(255,255,255,.08);flex:none;}
++.tab{background:none;border:none;border-bottom:2px solid transparent;color:#7d8b98;font-family:inherit;font-size:12.5px;font-weight:600;letter-spacing:.3px;padding:6px 12px;cursor:pointer;transition:color .15s,border-color .15s;}
++.tab:hover{color:#c3ced8;}
++.tab.on{color:#4ea3ff;border-bottom-color:#4ea3ff;}
++.hap-row{display:flex;flex-direction:column;gap:3px;background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:5px;padding:5px 10px;}
++.hap-head{display:flex;justify-content:space-between;align-items:baseline;}
++.hap-name{font-size:13px;color:#c3ced8;}
++.hap-val{font-family:'JetBrains Mono',monospace;font-size:12px;color:#4ea3ff;}
++.hap-note{font-size:10.5px;color:#5c6b78;line-height:1.35;}
++input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:2px;background:rgba(255,255,255,.12);outline:none;}
++input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#4ea3ff;cursor:pointer;}
++#eq{display:flex;justify-content:space-between;gap:6px;padding:2px;}
++.eq-band{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;}
++.eq-band input[type=range]{-webkit-appearance:slider-vertical;writing-mode:vertical-lr;direction:rtl;width:6px;height:70px;}
++.eq-hz{font-family:'JetBrains Mono',monospace;font-size:11px;color:#7d8b98;}
++.eq-val{font-family:'JetBrains Mono',monospace;font-size:10px;color:#4ea3ff;}
++.eq-val.off{color:#5c6b78;}
++.hap-check{display:flex;align-items:center;gap:10px;}
++.hap-check label{font-size:13px;color:#c3ced8;cursor:pointer;}
++#hap-status{font-family:'JetBrains Mono',monospace;font-size:11px;color:#5c6b78;padding-top:4px;}
+ </style>
+ </head>
+ <body>
+@@ -152,11 +178,14 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+   </div>
+ </div>
+ 
++<div id="tabs">
++  <button class="tab on" id="tab-btn-controls">Controls</button>
++  <button class="tab" id="tab-btn-haptics">Audio Haptics</button>
++</div>
++
+ <div id="body">
+-  <div>
+-    <h2>Customize Controls</h2>
+-    <p class="instr">Click <b>Rebind</b> on any button, then press any gamepad button on your controller &#8212; or any key on your keyboard, or your mouse's middle or thumb buttons. The new binding shows up here instantly. Pick <b>Off</b> to stop a button doing anything at all.</p>
+-  </div>
++  <div id="tab-controls">
++  <p class="instr">Click <b>Rebind</b>, then press any gamepad button, key, or your mouse's middle or thumb buttons. Pick <b>Off</b> to unbind.</p>
+   <div class="group">
+     <div class="group-label">APPLY TO</div>
+     <div class="combo-wrap">
+@@ -190,6 +219,7 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+       </div>
+     </div>
+   </div>
++  <div class="pair">
+   <div class="group">
+     <div class="group-label">LEFT TRACKPAD</div>
+     <div class="row mode-row">
+@@ -226,6 +256,8 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+     </div>
+     <div id="row-RPAD" class="row"></div>
+   </div>
++  </div><!-- /.pair -->
++  <div class="pair">
+   <div class="group">
+     <div class="group-label">LEFT GRIP</div>
+     <div id="row-L4" class="row"></div>
+@@ -236,6 +268,73 @@ button{font-family:'Barlow',system-ui,sans-serif;cursor:pointer;border:none;back
+     <div id="row-R4" class="row"></div>
+     <div id="row-R5" class="row"></div>
+   </div>
++  </div><!-- /.pair -->
++  </div><!-- /#settings -->
++  </div><!-- /#tab-controls -->
++
++  <div id="tab-haptics" style="display:none;">
++    <p class="instr">System audio is streamed to the trackpad actuators as PCM. <b>Normal rumble is disabled</b> while this is on, and every change applies immediately.</p>
++
++    <div class="group">
++      <div class="hap-check">
++        <input type="checkbox" id="hap-on">
++        <label for="hap-on">Replace rumble with audio haptics</label>
++      </div>
++    </div>
++
++    <div class="group">
++      <div class="group-label">STRENGTH</div>
++      <div class="hap-row">
++        <div class="hap-head"><span class="hap-name">Strength</span><span class="hap-val" id="hap-gain-v"></span></div>
++        <input type="range" id="hap-gain" min="25" max="2000">
++      </div>
++    </div>
++
++    <div class="pair">
++    <div class="group">
++      <div class="group-label">EQUALISER (Hz)</div>
++      <div class="hap-row">
++        <div id="eq"></div>
++        <div class="hap-note">A band at zero is removed entirely. Little above 120 Hz is felt as texture.</div>
++      </div>
++    </div>
++
++    <div class="group">
++      <div class="group-label">TIMING</div>
++      <div class="hap-row">
++        <div class="hap-head"><span class="hap-name">Delay (sync to speakers)</span><span class="hap-val" id="hap-delay-v"></span></div>
++        <input type="range" id="hap-delay" min="0" max="500">
++        <div class="hap-note">The pad otherwise leads the speakers. Only the sound is delayed, never the response.</div>
++      </div>
++      <div class="hap-row">
++        <div class="hap-head"><span class="hap-name">Buffer (higher is smoother)</span><span class="hap-val" id="hap-buf-v"></span></div>
++        <input type="range" id="hap-buf" min="4" max="64">
++      </div>
++      <div class="row mode-row">
++        <div class="row-top">
++          <span class="pos-label">Transport rate</span>
++          <div class="connector"></div>
++          <select id="hap-rate" class="mode-select">
++            <option value="4000">4 kHz (wireless)</option>
++            <option value="8000">8 kHz</option>
++          </select>
++        </div>
++      </div>
++      <div class="hap-note">A write waits 4 ms for the radio slot, so 4 kHz is the sustainable wireless rate.</div>
++    </div>
++    </div><!-- /.pair -->
++
++    <div class="group">
++      <div class="group-label">WHEN</div>
++      <div class="hap-row">
++        <div class="hap-check">
++          <input type="checkbox" id="hap-gate">
++          <label for="hap-gate">Only while the game asks for rumble</label>
++        </div>
++        <div class="hap-note">The game supplies the timing, the audio supplies the texture.</div>
++      </div>
++      <div id="hap-status"></div>
++    </div>
+   </div>
+ </div>
+ 
+@@ -446,6 +545,9 @@ if(window.chrome&&window.chrome.webview){
+       renderComboLabel();
+       renderModeSelects();
+       renderAll();
++      // The haptics tab is painted from the same message, so it never shows a
++      // value the engine is not actually using.
++      if (typeof hapApplyState === 'function') hapApplyState(msg);
+     } else if(msg.type==='closeRequested'){
+       // C++ asks before hiding the window so an unsaved profile isn't lost.
+       guard(function(){postMsg({type:'close'});});
+@@ -1021,6 +1123,92 @@ document.addEventListener('keyup',function(e){
+ });
+ 
+ renderAll();
++
++// ---- Audio haptics tab ----
++// The page owns no state of its own here: every change posts the whole set and
++// the host applies it live, which is why there is no Apply button on this tab.
++var HAP_HZ = ['30','60','120','240','480','960'];
++var hapReady = false;
++
++function hapSwitch(toHaptics){
++  // A row left listening keeps the host capturing the controller, and its only
++  // sign is a highlight on a row this tab is about to hide - so the next button
++  // press would rebind something invisibly. Same for the game picker: it would
++  // still be open, mid-search, on the way back.
++  if (toHaptics) { cancelListening(); closeCombo(); }
++  document.getElementById('tab-controls').style.display = toHaptics ? 'none' : '';
++  document.getElementById('tab-haptics').style.display  = toHaptics ? '' : 'none';
++  // Apply and Reset commit a controller profile, which the haptics tab has no
++  // concept of - its changes are already live. Leaving the bar visible there
++  // implied there was something pending to save.
++  document.getElementById('footer').style.display = toHaptics ? 'none' : '';
++  document.getElementById('tab-btn-controls').className = toHaptics ? 'tab' : 'tab on';
++  document.getElementById('tab-btn-haptics').className  = toHaptics ? 'tab on' : 'tab';
++}
++document.getElementById('tab-btn-controls').onclick = function(){ hapSwitch(false); };
++document.getElementById('tab-btn-haptics').onclick  = function(){ hapSwitch(true); };
++
++(function buildEq(){
++  var eq = document.getElementById('eq');
++  var html = '';
++  for (var i = 0; i < HAP_HZ.length; i++) {
++    html += '<div class="eq-band">'
++          + '<input type="range" id="eq-' + i + '" min="0" max="400" orient="vertical">'
++          + '<div class="eq-hz">' + HAP_HZ[i] + '</div>'
++          + '<div class="eq-val" id="eq-v-' + i + '"></div>'
++          + '</div>';
++  }
++  eq.innerHTML = html;
++})();
++
++function hapLabels(){
++  document.getElementById('hap-gain-v').textContent  = document.getElementById('hap-gain').value + '%';
++  document.getElementById('hap-delay-v').textContent = document.getElementById('hap-delay').value + ' ms';
++  document.getElementById('hap-buf-v').textContent   = document.getElementById('hap-buf').value + ' packets';
++  for (var i = 0; i < HAP_HZ.length; i++) {
++    var v = document.getElementById('eq-' + i).value;
++    var el = document.getElementById('eq-v-' + i);
++    el.textContent = (v === '0') ? 'off' : v + '%';
++    el.className = (v === '0') ? 'eq-val off' : 'eq-val';
++  }
++}
++
++function hapSend(){
++  if (!hapReady) return;
++  hapLabels();
++  var m = {type:'haptics',
++    on:    document.getElementById('hap-on').checked ? '1' : '0',
++    gain:  document.getElementById('hap-gain').value,
++    delay: document.getElementById('hap-delay').value,
++    buf:   document.getElementById('hap-buf').value,
++    rate:  document.getElementById('hap-rate').value,
++    gate:  document.getElementById('hap-gate').checked ? '1' : '0'};
++  for (var i = 0; i < HAP_HZ.length; i++) m['eq' + i] = document.getElementById('eq-' + i).value;
++  window.chrome.webview.postMessage(JSON.stringify(m));
++}
++
++function hapApplyState(st){
++  document.getElementById('hap-on').checked   = st.hapOn === '1';
++  document.getElementById('hap-gain').value   = st.hapGain;
++  document.getElementById('hap-delay').value  = st.hapDelay;
++  document.getElementById('hap-buf').value    = st.hapBuf;
++  document.getElementById('hap-rate').value   = st.hapRate;
++  document.getElementById('hap-gate').checked = st.hapGate === '1';
++  for (var i = 0; i < HAP_HZ.length; i++) document.getElementById('eq-' + i).value = st['hapEq' + i];
++  hapLabels();
++  hapReady = true;
++}
++
++(function wireHap(){
++  var ids = ['hap-on','hap-gain','hap-delay','hap-buf','hap-rate','hap-gate'];
++  for (var i = 0; i < HAP_HZ.length; i++) ids.push('eq-' + i);
++  ids.forEach(function(id){
++    var el = document.getElementById(id);
++    el.addEventListener('input',  hapSend);
++    el.addEventListener('change', hapSend);
++  });
++})();
++
+ </script>
+ </body>
+ </html>
+@@ -1120,6 +1308,7 @@ LRESULT RemapWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+             // The right ~96px of the title bar hosts our close/min buttons —
+             // leave those as HTCLIENT so WebView2 can receive the clicks.
+             UINT dpi   = GetDpiForWindow(hwnd);
++            // Mirrors #titlebar{height:46px} in the page - keep in step.
+             int  tbPx  = MulDiv(46, dpi, 96);   // CSS 46px → physical pixels
+             int  ctlPx = MulDiv(96, dpi, 96);
+             if (pt.y < tbPx && pt.x < rc.right - ctlPx)
+@@ -1339,15 +1528,21 @@ void RemapWindow::OnControllerReady(ICoreWebView2Controller* ctrl) {
+     m_controller = ctrl;
+     m_controller->get_CoreWebView2(&m_webview);
+ 
+-    // Settings: disable context menu and dev tools in production.
++    // Settings: context menu and dev tools are off in production, and on when
++    // HKCU\\Software\\\\SteamlessController\\DevMode is 1. A Release build is the
++    // only build anyone runs, so #ifndef _DEBUG meant the page could never be
++    // inspected on a machine where a layout bug actually reproduced.
+     Microsoft::WRL::ComPtr<ICoreWebView2Settings> settings;
+     m_webview->get_Settings(&settings);
+     if (settings) {
+-        settings->put_AreDefaultContextMenusEnabled(FALSE);
++        DWORD devMode = 0;
++        DWORD cb = sizeof(devMode);
++        RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController", L"DevMode",
++                     RRF_RT_REG_DWORD, nullptr, &devMode, &cb);
++        const BOOL dev = devMode != 0 ? TRUE : FALSE;
++        settings->put_AreDefaultContextMenusEnabled(dev);
+         settings->put_IsStatusBarEnabled(FALSE);
+-#ifndef _DEBUG
+-        settings->put_AreDevToolsEnabled(FALSE);
+-#endif
++        settings->put_AreDevToolsEnabled(dev);
+     }
+ 
+     // Size the WebView2 to fill the window.
+@@ -1446,6 +1641,33 @@ static bool GameIndexFrom(const std::string& value, size_t count, size_t& out) {
+     return true;
+ }
+ 
++
++namespace {
++
++/** Writes one haptics DWORD. The page is the only writer while it is open. */
++void WriteHapticSetting(const wchar_t* name, DWORD value) {
++    HKEY key = nullptr;
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\SteamlessController", 0, nullptr, 0,
++                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
++        return;
++    }
++    RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
++    RegCloseKey(key);
++}
++
++/** Reads one haptics DWORD, falling back to the engine's own default. */
++DWORD ReadHapticSetting(const wchar_t* name, DWORD fallback) {
++    DWORD data = 0;
++    DWORD cb = sizeof(data);
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController", name, RRF_RT_REG_DWORD,
++                     nullptr, &data, &cb) != ERROR_SUCCESS) {
++        return fallback;
++    }
++    return data;
++}
++
++} // namespace
++
+ void RemapWindow::OnWebMessage(const std::wstring& raw) {
+     // All message content is ASCII; narrow explicitly to suppress C4244.
+     std::string msg;
+@@ -1454,7 +1676,33 @@ void RemapWindow::OnWebMessage(const std::wstring& raw) {
+ 
+     std::string type = JsonStr(msg, "type");
+ 
+-    if (type == "startDrag") {
++    if (type == "haptics") {
++        // Applied live: the settings are the transport, and AudioHaptics reloads
++        // them without a restart. Gain, EQ, delay and buffer reach the capture
++        // loop on the next report; the enable flag and the rate restart the
++        // stream. Nothing here needs an Apply button, which is why this tab has
++        // none while the Controls tab does.
++        auto num = [&](const char* key, DWORD fallback) -> DWORD {
++            const std::string v = JsonStr(msg, key);
++            if (v.empty()) return fallback;
++            return static_cast<DWORD>(std::strtoul(v.c_str(), nullptr, 10));
++        };
++        WriteHapticSetting(L"HapticAudioMode", num("on", 0));
++        WriteHapticSetting(L"HapticAudioGain", num("gain", 854));
++        WriteHapticSetting(L"HapticAudioDelayMs", num("delay", 68));
++        WriteHapticSetting(L"HapticAudioLatency", num("buf", 64));
++        WriteHapticSetting(L"HapticAudioRate", num("rate", 4000));
++        WriteHapticSetting(L"HapticRumbleGate", num("gate", 1));
++        for (int band = 0; band < AudioHaptics::kBandCount; ++band) {
++            char key[16];
++            std::snprintf(key, sizeof(key), "eq%d", band);
++            wchar_t name[32];
++            _snwprintf_s(name, _TRUNCATE, L"HapticEqBand%d", band);
++            WriteHapticSetting(name, num(key, 0));
++        }
++        AudioHaptics::Instance().Reload();
++
++    } else if (type == "startDrag") {
+         // Safe to call from WndProc context (we're on the UI thread).
+         ReleaseCapture();
+         PostMessageW(m_hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
+@@ -1651,10 +1899,34 @@ void RemapWindow::SendInitState() {
+         profilesJson += L",\"" + std::to_wstring(i) + L"\":" + profileJson(it->second);
+     }
+ 
++    // Defaults here must match AudioHaptics', or the first paint would show
++    // values the engine is not using. HapticAudioMode did not: this said 1 while
++    // the engine reads 0, so a fresh install showed audio haptics ticked and ran
++    // them off. Off is right - it replaces the user's rumble, so it is opt-in.
++    std::wstring hapticsJson =
++        L",\"hapOn\":\"" + std::to_wstring(ReadHapticSetting(L"HapticAudioMode", 0)) + L"\""
++        L",\"hapGain\":\"" + std::to_wstring(ReadHapticSetting(L"HapticAudioGain", 854)) + L"\""
++        L",\"hapDelay\":\"" + std::to_wstring(ReadHapticSetting(L"HapticAudioDelayMs", 68)) + L"\""
++        L",\"hapBuf\":\"" + std::to_wstring(ReadHapticSetting(L"HapticAudioLatency", 64)) + L"\""
++        L",\"hapRate\":\"" + std::to_wstring(ReadHapticSetting(L"HapticAudioRate", 4000)) + L"\""
++        L",\"hapGate\":\"" + std::to_wstring(ReadHapticSetting(L"HapticRumbleGate", 1)) + L"\"";
++    {
++        const DWORD bandDefaults[AudioHaptics::kBandCount] = {400, 160, 0, 0, 0, 0};
++        for (int band = 0; band < AudioHaptics::kBandCount; ++band) {
++            wchar_t name[32];
++            _snwprintf_s(name, _TRUNCATE, L"HapticEqBand%d", band);
++            hapticsJson += L",\"hapEq" + std::to_wstring(band) + L"\":\""
++                           + std::to_wstring(ReadHapticSetting(name, bandDefaults[band])) + L"\"";
++        }
++    }
++
+     std::wstring json =
+         L"{\"type\":\"init\""
+         L",\"labels\":{" + labels + L"}"
+         L",\"games\":[" + gamesJson + L"]"
+-        L",\"profiles\":{" + profilesJson + L"}}";
++        L",\"profiles\":{" + profilesJson + L"}"
++        // Haptics travel in the same init object rather than a second message,
++        // so the page cannot paint that tab before it knows the values.
++        + hapticsJson + L"}";
+     PostToWebView(json);
+ }
+diff --git a/src/app/RemapWindow.h b/src/app/RemapWindow.h
+index 674b126..6fc940e 100644
+--- a/src/app/RemapWindow.h
++++ b/src/app/RemapWindow.h
+@@ -102,8 +102,8 @@ private:
+     // Design sizes in logical (96-DPI) pixels — scaled to the monitor's DPI
+     // at creation. The process is PER_MONITOR_AWARE_V2, so nothing scales
+     // these for us.
+-    static constexpr int WINDOW_W = 760;
+-    static constexpr int WINDOW_H = 668; // 46 titlebar + ~560 body + 62 footer
++    static constexpr int WINDOW_W = 900;  // a paired column needs 390; this gives 406
++    static constexpr int WINDOW_H = 668; // 46 titlebar + 30 tabs + body + 50 footer
+     static constexpr int MIN_WINDOW_W = 560;
+     static constexpr int MIN_WINDOW_H = 440;
+ };
+diff --git a/src/app/TrackpadMouse.cpp b/src/app/TrackpadMouse.cpp
+index 6fcd709..4a3ccfe 100644
+--- a/src/app/TrackpadMouse.cpp
++++ b/src/app/TrackpadMouse.cpp
+@@ -1,11 +1,157 @@
+ #include "TrackpadMouse.h"
+ #include "InputInjection.h"
++#include "ForegroundWatcher.h"
++#include "EventLog.h"
+ #include "steam/SteamController.h"
+ #include <Windows.h>
++#include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+ #include <cstdint>
+ 
++namespace {
++
++// Seconds from the performance counter. The frequency is fixed for the life of
++// the process, so it is only ever queried once.
++double NowSec() {
++    static const double freq = [] {
++        LARGE_INTEGER f{};
++        QueryPerformanceFrequency(&f);
++        return f.QuadPart ? static_cast<double>(f.QuadPart) : 1.0;
++    }();
++    LARGE_INTEGER c{};
++    QueryPerformanceCounter(&c);
++    return static_cast<double>(c.QuadPart) / freq;
++}
++
++}  // namespace
++
++// Tunable for the same reason momentum is: how hard a given person presses is
++// not a constant, and the alternative to a setting is a rebuild per guess.
++static unsigned ReadPadDword(const wchar_t* name, unsigned fallback, unsigned cap) {
++    DWORD data = 0;
++    DWORD cb   = sizeof(data);
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController", name,
++                     RRF_RT_REG_DWORD, nullptr, &data, &cb) == ERROR_SUCCESS) {
++        return data > cap ? cap : data;
++    }
++    return fallback;
++}
++
++unsigned TrackpadMouse::PressArea() {
++    static const unsigned v = ReadPadDword(L"PadPressArea", 1400, 8000);
++    return v;
++}
++
++unsigned TrackpadMouse::ReleaseArea() {
++    // Comfortably above a resting touch (300-600) and below a press, so a
++    // finger simply left on the pad does not hold the freeze on for ever.
++    static const unsigned v = ReadPadDword(L"PadPressReleaseArea", 900, 8000);
++    return v;
++}
++
++float TrackpadMouse::PressReleaseGraceSec() {
++    // The haptics path measured peel-off settle at about 180ms; the cursor only
++    // has to outlast the part of it that actually moves the centroid.
++    static const float v =
++        static_cast<float>(ReadPadDword(L"PadPressGraceMs", 120, 1000)) / 1000.0f;
++    return v;
++}
++
++// Coasting is deliberately tunable at runtime rather than compiled in: "a bit
++// of momentum" is a matter of feel, and the alternative is a rebuild per guess.
++float TrackpadMouse::MomentumTauSec() {
++    static const float tau = [] {
++        DWORD ms   = 300;   // enough to glide, short of skating away
++        DWORD data = 0;
++        DWORD cb   = sizeof(data);
++        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController",
++                         L"PadMomentumMs", RRF_RT_REG_DWORD, nullptr,
++                         &data, &cb) == ERROR_SUCCESS) {
++            ms = data;
++        }
++        if (ms > 2000) ms = 2000;   // past this it is not momentum, it is drift
++        return static_cast<float>(ms) / 1000.0f;
++    }();
++    return tau;
++}
++
++// How much to divide scroll by in a row-snapping UI. Tunable, because "one
++// row per flick" is a matter of taste and the alternative is a rebuild.
++float TrackpadMouse::XboxScrollDivisor() {
++    static const float divisor = [] {
++        DWORD v    = 6;
++        DWORD data = 0;
++        DWORD cb   = sizeof(data);
++        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController",
++                         L"XboxScrollDivisor", RRF_RT_REG_DWORD, nullptr,
++                         &data, &cb) == ERROR_SUCCESS) {
++            v = data;
++        }
++        if (v < 1)  v = 1;    // 1 restores stock behaviour
++        if (v > 50) v = 50;
++        return static_cast<float>(v);
++    }();
++    return divisor;
++}
++
++bool TrackpadMouse::XboxWarpCursorEnabled() {
++    static const bool on = [] {
++        DWORD data = 0;
++        DWORD cb   = sizeof(data);
++        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController",
++                         L"XboxScrollWarpCursor", RRF_RT_REG_DWORD, nullptr,
++                         &data, &cb) == ERROR_SUCCESS) {
++            return data != 0;
++        }
++        return true;   // on by default; without it scrolling silently does nothing
++    }();
++    return on;
++}
++
++void TrackpadMouse::EnsureCursorOverContent() {
++    if (!XboxWarpCursorEnabled()) return;
++
++    const HWND fg = GetForegroundWindow();
++    if (!fg) return;
++    RECT r{};
++    if (!GetWindowRect(fg, &r)) return;
++    POINT c{};
++    if (!GetCursorPos(&c)) return;
++
++    const LONG insetX = (r.right - r.left) / CONTENT_INSET_DIVISOR;
++    const LONG insetY = (r.bottom - r.top) / CONTENT_INSET_DIVISOR;
++    if (c.x >= r.left + insetX && c.x <= r.right  - insetX
++     && c.y >= r.top  + insetY && c.y <= r.bottom - insetY) {
++        return;   // already somewhere a wheel event will be received
++    }
++
++    const int cx = static_cast<int>((r.left + r.right) / 2);
++    const int cy = static_cast<int>((r.top + r.bottom) / 2);
++    if (SetCursorPos(cx, cy)) {
++        EventLog::Write("SCROLL: cursor was at (%ld,%ld), off the content area "
++                        "— moved to (%d,%d) so the wheel lands",
++                        c.x, c.y, cx, cy);
++    }
++}
++
++float TrackpadMouse::ScrollScale() {
++    const double now = NowSec();
++    if (now - m_fgCheckedAt >= FG_RECHECK_SEC) {
++        m_fgCheckedAt = now;
++        // Prefix, not the whole AUMID: the Xbox app runs as ...!Microsoft.Xbox.AppL
++        // in the full screen experience and ...!Microsoft.Xbox.App elsewhere.
++        const ForegroundIdentity id = ForegroundWatcher::Current();
++        const bool snapping = id.aumid.rfind(L"Microsoft.GamingApp_", 0) == 0;
++        if (snapping != m_fgRowSnapping) {
++            m_fgRowSnapping = snapping;
++            EventLog::Write("SCROLL: %s row-snapping scaling (1/%.0f)",
++                            snapping ? "entered" : "left", XboxScrollDivisor());
++        }
++    }
++    return m_fgRowSnapping ? (1.0f / XboxScrollDivisor()) : 1.0f;
++}
++
+ void TrackpadMouse::SetMode(TrackpadMode mode) {
+     if (mode == m_mode) return;
+     m_mode = mode;
+@@ -22,6 +168,89 @@ void TrackpadMouse::Reset() {
+     m_scrollRemY = 0.0f;
+     m_haveRef    = false;
+     m_travelSent = 0;
++    m_velX       = 0.0f;
++    m_velY       = 0.0f;
++    m_coasting   = false;
++    m_coastRemX  = 0.0f;
++    m_coastRemY  = 0.0f;
++    // Losing the device mid-press must not leave the pointer frozen for ever.
++    m_pressFrozen = false;
++    m_unfreezeAt  = 0.0;
++    m_haveTime   = false;
++    ClearSamples();
++}
++
++void TrackpadMouse::PushSample(double t, float x, float y) {
++    m_hist[m_histHead] = Sample{ t, x, y };
++    m_histHead = (m_histHead + 1) % HISTORY_SIZE;
++    if (m_histCount < HISTORY_SIZE) ++m_histCount;
++}
++
++// Least-squares fit of position against time over the horizon, velocity being
++// the first derivative at the newest sample. Time is measured relative to that
++// newest sample so the fitted linear coefficient is the velocity at lift-off
++// directly, with no evaluation step and no loss of conditioning from large
++// absolute timestamps.
++bool TrackpadMouse::EstimateVelocity(float& vx, float& vy) const {
++    if (m_histCount < 2) return false;
++
++    const int    newest = (m_histHead - 1 + HISTORY_SIZE) % HISTORY_SIZE;
++    const double tNew   = m_hist[newest].t;
++
++    // Sums for the normal equations of y = b0 + b1*t + b2*t^2.
++    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
++    double gx0 = 0.0, gx1 = 0.0, gx2 = 0.0;
++    double gy0 = 0.0, gy1 = 0.0, gy2 = 0.0;
++    int    used = 0;
++
++    for (int i = 0; i < m_histCount; ++i) {
++        const int    idx = (newest - i + HISTORY_SIZE) % HISTORY_SIZE;
++        const double t   = m_hist[idx].t - tNew;          // <= 0
++        if (-t > static_cast<double>(HORIZON_SEC)) break;  // older than the horizon
++
++        const double x = static_cast<double>(m_hist[idx].x);
++        const double y = static_cast<double>(m_hist[idx].y);
++        const double t2 = t * t;
++
++        s0 += 1.0; s1 += t; s2 += t2; s3 += t2 * t; s4 += t2 * t2;
++        gx0 += x; gx1 += t * x; gx2 += t2 * x;
++        gy0 += y; gy1 += t * y; gy2 += t2 * y;
++        ++used;
++    }
++
++    if (used < 2) return false;
++
++    // Straight line through the window. Also the fallback when the quadratic
++    // system is degenerate, which happens when the samples span too little
++    // time to support three coefficients.
++    const double linDet = s0 * s2 - s1 * s1;
++    if (std::fabs(linDet) < 1e-12) return false;
++
++    if (used >= 3) {
++        const double det =
++              s0 * (s2 * s4 - s3 * s3)
++            - s1 * (s1 * s4 - s3 * s2)
++            + s2 * (s1 * s3 - s2 * s2);
++
++        if (std::fabs(det) > 1e-18) {
++            const double detX =
++                  s0 * (gx1 * s4 - s3 * gx2)
++                - gx0 * (s1 * s4 - s3 * s2)
++                + s2 * (s1 * gx2 - gx1 * s2);
++            const double detY =
++                  s0 * (gy1 * s4 - s3 * gy2)
++                - gy0 * (s1 * s4 - s3 * s2)
++                + s2 * (s1 * gy2 - gy1 * s2);
++
++            vx = static_cast<float>(detX / det);
++            vy = static_cast<float>(detY / det);
++            if (std::isfinite(vx) && std::isfinite(vy)) return true;
++        }
++    }
++
++    vx = static_cast<float>((s0 * gx1 - s1 * gx0) / linDet);
++    vy = static_cast<float>((s0 * gy1 - s1 * gy0) / linDet);
++    return std::isfinite(vx) && std::isfinite(vy);
+ }
+ 
+ // Tracks whether accepted movement is reaching the cursor. Re-arms whenever the
+@@ -89,29 +318,91 @@ void TrackpadMouse::UpdatePointer(int dx, int dy) {
+ void TrackpadMouse::UpdateScroll(int dx, int dy) {
+     if (m_scrollDir == ScrollDirection::Natural) { dx = -dx; dy = -dy; }
+ 
+-    const float fy = static_cast<float>(dy) * SCROLL_SENSITIVITY + m_scrollRemY;
+-    const float fx = static_cast<float>(dx) * SCROLL_SENSITIVITY + m_scrollRemX;
+-    const LONG  iy = static_cast<LONG>(fy);
+-    const LONG  ix = static_cast<LONG>(fx);
+-    m_scrollRemY = fy - static_cast<float>(iy);
+-    m_scrollRemX = fx - static_cast<float>(ix);
++    const float scale = ScrollScale();
++    m_scrollRemY += static_cast<float>(dy) * SCROLL_SENSITIVITY * scale;
++    m_scrollRemX += static_cast<float>(dx) * SCROLL_SENSITIVITY * scale;
++
++    // Emit whole detents only, and carry the rest.
++    //
++    // Sub-detent wheel events are legal, and classic Win32 scroll bars simply
++    // accumulate them — which is why this went unnoticed. WinUI/UWP surfaces
++    // do not: each wheel message retargets a smooth-scroll animation, so a
++    // continuous stream of fractional deltas retargets it to somewhere it has
++    // effectively already reached, over and over. The view shivers in place
++    // and never travels. The Xbox full screen experience is exactly that kind
++    // of surface, and it is the one place this pad has to work. A physical
++    // wheel only ever sends whole notches; so does this now.
++    const float detent   = static_cast<float>(WHEEL_DELTA);
++    const int   notchesY = static_cast<int>(m_scrollRemY / detent);
++    const int   notchesX = static_cast<int>(m_scrollRemX / detent);
++    m_scrollRemY -= static_cast<float>(notchesY) * detent;
++    m_scrollRemX -= static_cast<float>(notchesX) * detent;
++
++    // Only in a row-snapping UI, only once per gesture, and only when the
++    // cursor is somewhere useless — an ordinary app scrolls what you point at,
++    // and that is the behaviour people expect.
++    if (m_fgRowSnapping && !m_warpedThisGesture && (notchesY != 0 || notchesX != 0)) {
++        EnsureCursorOverContent();
++        m_warpedThisGesture = true;
++    }
+ 
+-    if (iy != 0) {
++    if (notchesY != 0) {
+         INPUT input{};
+         input.type         = INPUT_MOUSE;
+         input.mi.dwFlags   = MOUSEEVENTF_WHEEL;
+-        input.mi.mouseData = static_cast<DWORD>(iy);
++        input.mi.mouseData = static_cast<DWORD>(notchesY * WHEEL_DELTA);
+         InputInjection::Send(input, "trackpad-scroll");
+     }
+-    if (ix != 0) {
++    if (notchesX != 0) {
+         INPUT input{};
+         input.type         = INPUT_MOUSE;
+         input.mi.dwFlags   = MOUSEEVENTF_HWHEEL;
+-        input.mi.mouseData = static_cast<DWORD>(ix);
++        input.mi.mouseData = static_cast<DWORD>(notchesX * WHEEL_DELTA);
+         InputInjection::Send(input, "trackpad-hscroll");
+     }
+ }
+ 
++void TrackpadMouse::Emit(int dxRaw, int dyRaw) {
++    if (m_mode == TrackpadMode::MousePointer) {
++        // Pad Y grows upward, screen Y grows downward.
++        UpdatePointer(dxRaw, -dyRaw);
++    } else {
++        // Raw deltas — UpdateScroll owns the direction convention.
++        UpdateScroll(dxRaw, dyRaw);
++    }
++}
++
++// One frame of glide after the finger has gone. Decay is exponential in real
++// time rather than per report, so the feel does not change with the controller's
++// report rate or a hitching frame.
++void TrackpadMouse::Coast(float dtSec) {
++    const float tau = MomentumTauSec();
++    if (dtSec <= 0.0f || tau <= 0.0f) { m_coasting = false; return; }
++
++    const float decay = std::exp(-dtSec / tau);
++    m_velX *= decay;
++    m_velY *= decay;
++
++    if (std::sqrt(m_velX * m_velX + m_velY * m_velY) < MIN_COAST_SPEED) {
++        m_coasting = false;
++        m_velX = 0.0f;
++        m_velY = 0.0f;
++        return;
++    }
++
++    // Same sub-unit carry as everywhere else: at the tail of a glide the
++    // per-frame distance is well under one raw unit, and truncating it would
++    // end the coast early and abruptly.
++    const float fx = m_velX * dtSec + m_coastRemX;
++    const float fy = m_velY * dtSec + m_coastRemY;
++    const int   ix = static_cast<int>(fx);
++    const int   iy = static_cast<int>(fy);
++    m_coastRemX = fx - static_cast<float>(ix);
++    m_coastRemY = fy - static_cast<float>(iy);
++
++    if (ix != 0 || iy != 0) Emit(ix, iy);
++}
++
+ void TrackpadMouse::Update(const uint8_t* buf, size_t n) {
+     // Pad clicks are handled by ControllerManager, alongside every other
+     // binding — this is movement only. Only the two desktop-driving modes
+@@ -120,6 +411,18 @@ void TrackpadMouse::Update(const uint8_t* buf, size_t n) {
+         || (m_mode != TrackpadMode::MousePointer && m_mode != TrackpadMode::ScrollWheel))
+         return;
+ 
++    // Reports keep arriving after the finger lifts, and that is what drives the
++    // coast — so timing is updated on every report, not only touched ones.
++    const double now = NowSec();
++    float dt = 0.0f;
++    if (m_haveTime) {
++        const double elapsed = now - m_lastTime;
++        if (elapsed > 0.0 && elapsed <= static_cast<double>(MAX_FRAME_SEC))
++            dt = static_cast<float>(elapsed);
++    }
++    m_lastTime = now;
++    m_haveTime = true;
++
+     const uint8_t b2 = buf[4];
+     const uint8_t b3 = buf[5];
+ 
+@@ -136,18 +439,78 @@ void TrackpadMouse::Update(const uint8_t* buf, size_t n) {
+         memcpy(&y, buf + 26, 2);
+     }
+ 
+-    if (touching && m_touching) {
+-        const int dxRaw = static_cast<int>(x - m_prevX);
+-        const int dyRaw = static_cast<int>(y - m_prevY);
+-        if (dxRaw != 0 || dyRaw != 0) {
+-            if (m_mode == TrackpadMode::MousePointer) {
+-                // Pad Y grows upward, screen Y grows downward.
+-                UpdatePointer(dxRaw, -dyRaw);
+-            } else {
+-                // Raw deltas — UpdateScroll owns the direction convention.
+-                UpdateScroll(dxRaw, dyRaw);
++    // Press freeze. Contact AREA is the trigger, not the click bit: the
++    // fingertip rolls while the pad is being loaded, so by the time the
++    // firmware calls it a click the cursor has already moved and Windows has
++    // already seen a drag. Area rises first, which is what makes it catchable.
++    uint16_t area = 0;
++    memcpy(&area, buf + (m_isLeftPad ? 22 : 28), 2);
++    const bool clicking = m_isLeftPad
++        ? (b3 & SteamController::BTN_TP_LT_CLICK) != 0
++        : (b2 & SteamController::BTN_TP_RT_CLICK) != 0;
++
++    if (clicking || area >= PressArea()) {
++        m_pressFrozen = true;
++        // Pushed ahead on every pressing report, so the grace is measured from
++        // the END of the press rather than its start.
++        m_unfreezeAt = now + static_cast<double>(PressReleaseGraceSec());
++        // A click landing mid-glide must not fling the cursor either.
++        m_coasting = false;
++    } else if (m_pressFrozen && area < ReleaseArea() && now >= m_unfreezeAt) {
++        m_pressFrozen = false;
++    }
++
++    if (touching) {
++        if (!m_touching) {
++            // A finger landing is a grab: whatever was gliding stops dead,
++            // which is what every touch surface does and what makes a flick
++            // catchable. The old swipe's history goes with it.
++            m_coasting  = false;
++            m_velX      = 0.0f;
++            m_velY      = 0.0f;
++            m_coastRemX = 0.0f;
++            m_coastRemY = 0.0f;
++            m_warpedThisGesture = false;
++            ClearSamples();
++        }
++
++        // Every touched report is sampled, moved or not — a stationary tail is
++        // exactly what tells the fit that "drag, pause, lift" is not a fling.
++        PushSample(now, static_cast<float>(x), static_cast<float>(y));
++
++        if (m_touching) {
++            const int dxRaw = static_cast<int>(x - m_prevX);
++            const int dyRaw = static_cast<int>(y - m_prevY);
++            // While frozen the travel is swallowed, not banked: m_prevX/m_prevY
++            // still advance below, so nothing accumulates to discharge in one
++            // jump the moment the freeze lifts.
++            if (!m_pressFrozen && (dxRaw != 0 || dyRaw != 0)) Emit(dxRaw, dyRaw);
++        }
++    } else if (m_touching) {
++        // Just released: ask the fit how fast the finger was actually going.
++        m_coasting  = false;
++        m_coastRemX = 0.0f;
++        m_coastRemY = 0.0f;
++
++        // A finger lifting off a CLICK is not a flick, whatever the samples
++        // say - the roll during the press looks like motion to the fit. Still
++        // frozen here means the press only just ended, so there is no coast.
++        float vx = 0.0f, vy = 0.0f;
++        if (MomentumTauSec() > 0.0f && !m_pressFrozen && EstimateVelocity(vx, vy)) {
++            float speed = std::sqrt(vx * vx + vy * vy);
++            if (speed > MAX_FLING_SPEED) {
++                const float k = MAX_FLING_SPEED / speed;
++                vx *= k; vy *= k; speed = MAX_FLING_SPEED;
++            }
++            if (speed >= MIN_FLICK_SPEED) {
++                m_velX     = vx;
++                m_velY     = vy;
++                m_coasting = true;
+             }
+         }
++        ClearSamples();
++    } else if (m_coasting) {
++        Coast(dt);
+     }
+ 
+     if (touching) { m_prevX = x; m_prevY = y; }
+diff --git a/src/app/TrackpadMouse.h b/src/app/TrackpadMouse.h
+index 4783efb..0454b56 100644
+--- a/src/app/TrackpadMouse.h
++++ b/src/app/TrackpadMouse.h
+@@ -26,6 +26,78 @@ private:
+     void UpdateScroll(int dx, int dy);
+     void NoteMovementSent(long px, bool haveCursor, long cursorX, long cursorY);
+ 
++    // Raw pad delta -> whichever desktop motion this pad's mode drives. Shared
++    // so that a coasting frame and a dragged frame are literally the same code
++    // path; anything that treated them differently would drift apart.
++    void Emit(int dxRaw, int dyRaw);
++    void Coast(float dtSec);
++
++    // A wheel notch is not a universal unit, and that is a second, separate
++    // problem from sub-detent shivering.
++    //
++    // An ordinary window scrolls about three lines per notch. The Xbox full
++    // screen experience is a TV-style row UI where one notch advances a whole
++    // content row - measured here at roughly 54% of the viewport. So the swipe
++    // that reads perfectly in a normal window throws the Xbox UI ten rows down
++    // the page, and a flick's coast piles more on top. Scroll output is scaled
++    // down while that app is in front; everywhere else is left alone, because
++    // everywhere else already feels right.
++    float        ScrollScale();
++    static float XboxScrollDivisor();
++
++    // Windows delivers a wheel event to the window under the *cursor*, not the
++    // focused one. In an ordinary app that is exactly right. In the Xbox full
++    // screen experience it is a trap: the UI is driven by a gamepad, nobody is
++    // looking at the pointer, and the other pad can easily have left it on the
++    // nav rail, the title bar or a screen edge - all of which swallow the
++    // wheel completely. Measured directly: six notches with the cursor at
++    // (3439,0) scrolled nothing at all, while the same six at the centre moved
++    // more than a full screen. So before the first notch of a gesture lands,
++    // make sure the cursor is somewhere the wheel can actually be received.
++    void         EnsureCursorOverContent();
++    static bool  XboxWarpCursorEnabled();
++
++    // How long coasting takes to decay to 1/e of its release speed, in seconds.
++    // Read once from HKCU\Software\SteamlessController\PadMomentumMs so the
++    // feel can be tuned without a rebuild; 0 disables coasting entirely.
++    static float MomentumTauSec();
++
++    // --- velocity estimation ------------------------------------------------
++    //
++    // Lift-off velocity is estimated by least-squares fitting the recent
++    // *positions* of the finger, not by differencing the last two reports.
++    // Differencing is the obvious approach and it does not work: a report gap
++    // is a few milliseconds, so dividing an integer pad delta by it turns one
++    // unit of capacitive jitter into hundreds of units per second, and any
++    // smoothing fast enough to still feel responsive is dominated by that
++    // noise. The result reads as chaotic, because it is describing the last
++    // two reports rather than the swipe.
++    //
++    // This is the approach Android's VelocityTracker settled on: keep a
++    // bounded history, discard anything older than a 100 ms horizon, and fit
++    // a 2nd-degree polynomial across what remains. The linear coefficient at
++    // the moment of release is the velocity. The quadratic term is what makes
++    // an accelerating flick feel right — a straight-line fit would report the
++    // average speed across the window, not the speed at the instant of lift.
++    //
++    // Sampling every touched report, including ones where the finger did not
++    // move, is deliberate: it is what makes "drag, pause, lift" correctly
++    // produce no fling at all, because the stationary tail is in the fit.
++    struct Sample { double t; float x; float y; };
++
++    void PushSample(double t, float x, float y);
++    void ClearSamples() { m_histCount = 0; m_histHead = 0; }
++    // Velocity in raw pad units per second. False when there is not enough
++    // recent history to say anything honest.
++    bool EstimateVelocity(float& vx, float& vy) const;
++
++    static constexpr int   HISTORY_SIZE = 32;     // 100 ms at the pad's report rate, with room
++    static constexpr float HORIZON_SEC  = 0.100f;
++
++    Sample   m_hist[HISTORY_SIZE]{};
++    int      m_histCount = 0;
++    int      m_histHead  = 0;   // next write index, buffer is circular
++
+     bool            m_isLeftPad = false;
+     TrackpadMode    m_mode      = TrackpadMode::None;
+     ScrollDirection m_scrollDir = ScrollDirection::Natural;
+@@ -38,6 +110,52 @@ private:
+     float    m_scrollRemX = 0.0f;  // sub-detent scroll carry
+     float    m_scrollRemY = 0.0f;
+ 
++    // Flick-to-coast. Movement used to stop dead the instant the finger left
++    // the pad, which reads as the pad snatching the cursor back rather than
++    // letting go of it.
++    float    m_velX      = 0.0f;   // raw pad units/sec, while coasting
++    float    m_velY      = 0.0f;
++    bool     m_coasting  = false;
++    float    m_coastRemX = 0.0f;  // sub-unit carry for synthesised raw deltas
++    float    m_coastRemY = 0.0f;
++    double   m_lastTime  = 0.0;   // seconds, from the performance counter
++    bool     m_haveTime  = false;
++
++    // Press freeze. Pressing a pad hard enough to click rolls the fingertip,
++    // and the centroid moves with it — so the cursor travelled between the
++    // button going down and coming up, and Windows read a click as a drag.
++    //
++    // Freezing on the CLICK BIT alone fixes only half of it: the roll starts
++    // while the finger is still loading the pad, before the firmware calls it
++    // a click. So the trigger is contact AREA, which rises first. The scale
++    // was established by the haptics work: a resting touch sits around
++    // 300-600, a press passes 1400 well before the click lands, and a full
++    // click reads about 4000.
++    bool     m_pressFrozen = false;
++    double   m_unfreezeAt  = 0.0;  // seconds; the finger is still peeling off
++
++    // Area to start freezing at, and the lower level it must fall back to
++    // before movement resumes. Hysteresis, because a hard press dips its own
++    // area as the finger flattens and a single threshold chatters there.
++    static unsigned PressArea();
++    static unsigned ReleaseArea();
++    // How long after the press ends before movement is trusted again.
++    static float    PressReleaseGraceSec();
++
++    // Which app is in front, refreshed at human speed rather than report speed
++    // — resolving it walks child windows to see past ApplicationFrameHost, and
++    // that is far too much to do 250 times a second.
++    double   m_fgCheckedAt   = 0.0;
++    bool     m_fgRowSnapping = false;
++    static constexpr double FG_RECHECK_SEC = 0.25;
++
++    // Once per gesture, not once per notch: repeatedly recentring mid-scroll
++    // would be the pad wrestling the pointer away from the user.
++    bool     m_warpedThisGesture = false;
++    // Fraction of the window treated as chrome rather than content, at each
++    // edge. The Xbox app's nav rail and header are both comfortably inside it.
++    static constexpr int CONTENT_INSET_DIVISOR = 5;   // outer fifth
++
+     // Movement Windows accepted, checked against the cursor actually moving.
+     // A refused SendInput reports itself; motion that is accepted and then
+     // discarded — by a cursor clip a game left behind, or a low-level hook
+@@ -58,4 +176,18 @@ private:
+     // page-length fling: the pad's axes span roughly +/-32000, and one wheel
+     // detent is WHEEL_DELTA (120).
+     static constexpr float SCROLL_SENSITIVITY = 0.02f;
++
++    // A deliberate drag across half the pad in a second is about 32000 units/s,
++    // and must NOT fling — you were placing the cursor, not throwing it. Set
++    // above that so only a genuine flick coasts.
++    static constexpr float MIN_FLICK_SPEED = 40000.0f;   // raw units/sec
++    // Ceiling, so a jitter spike at lift-off cannot launch the cursor across
++    // the desk. Roughly 4500 px/s once sensitivity is applied.
++    static constexpr float MAX_FLING_SPEED = 400000.0f;  // raw units/sec
++    // Coasting ends here instead of crawling asymptotically towards zero.
++    static constexpr float MIN_COAST_SPEED = 3000.0f;    // raw units/sec
++    // A gap longer than this is a stall, not a frame: the controller stopped
++    // reporting, the app was descheduled, the machine slept. Treating it as
++    // elapsed time would fire one enormous synthetic jump.
++    static constexpr float MAX_FRAME_SEC = 0.1f;
+ };
+diff --git a/src/app/TrayApp.cpp b/src/app/TrayApp.cpp
+index 1b5b26b..97ba6b1 100644
+--- a/src/app/TrayApp.cpp
++++ b/src/app/TrayApp.cpp
+@@ -1,4 +1,5 @@
+ #include "TrayApp.h"
++
+ #include "ControllerManager.h"
+ #include "ControllerPlatform.h"
+ #include "DeviceRestart.h"
+@@ -1245,11 +1246,19 @@ void TrayApp::ShowViGEmBalloon() {
+     nid.uID              = TRAY_UID;
+     nid.uFlags           = NIF_INFO;
+     nid.dwInfoFlags      = NIIF_WARNING;
+-    wcscpy_s(nid.szInfoTitle, missing ? L"Driver required" : L"Virtual gamepad unavailable");
++    // Says what the driver is FOR and what usually removes it. The old wording
++    // named ViGEmBus and nothing else, which read to its first real recipient
++    // as "you need a new version of something" - after Apollo's uninstaller had
++    // taken the driver with it (2026-09-26). The body is 213 of the 255
++    // characters szInfo holds, and wcscpy_s aborts rather than truncating, so
++    // measure before lengthening it.
++    wcscpy_s(nid.szInfoTitle, missing ? L"Xbox controller driver missing" : L"Virtual gamepad unavailable");
+     wcscpy_s(nid.szInfo,
+              missing
+-                 ? L"ViGEmBus is unavailable — not installed, or disabled in Device "
+-                   L"Manager under System devices. Click here to download it."
++                 ? L"The driver that lets your Steam Controller act as an Xbox pad "
++                   L"(ViGEmBus) is missing or switched off. Uninstalling a streaming "
++                   L"or controller app like Apollo or Sunshine often removes it. "
++                   L"Click here to reinstall it."
+                  : L"A virtual gamepad bus is present but would not accept a "
+                    L"controller. It may be disabled, or a version this app cannot "
+                    L"talk to. The event log has the details.");
+@@ -1634,7 +1643,9 @@ void TrayApp::ShowContextMenu() {
+     // which kind of pad the game sees — is configured in one window now, per
+     // profile. This menu used to carry three separate entries for pieces of
+     // that, none of which could be set per game.
+-    AppendMenuW(menu, MF_STRING, IDM_REMAP_BACK, L"Customize Controls...");
++    // One settings window, two tabs. Audio haptics used to have a window of its
++    // own, which meant two places to change how the controller behaves.
++    AppendMenuW(menu, MF_STRING, IDM_REMAP_BACK, L"Settings...");
+ 
+     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+ 
+diff --git a/src/app/TrayApp.h b/src/app/TrayApp.h
+index 4111fe8..d1f578d 100644
+--- a/src/app/TrayApp.h
++++ b/src/app/TrayApp.h
+@@ -232,6 +232,7 @@ private:
+     static constexpr UINT IDM_NOTIFICATIONS = 1014;
+     static constexpr UINT IDM_ENABLE_DEVICE = 1015;
+     static constexpr UINT IDM_MODE_PROFILE  = 1016;
++    static constexpr UINT IDM_HAPTICS       = 1017;
+     static constexpr UINT WM_TRAY           = WM_APP + 1;
+     static constexpr UINT WM_STEAMSTATE     = WM_APP + 2;
+     static constexpr UINT WM_ALERT          = WM_APP + 3;
+diff --git a/src/probe/AudioHapticsProbe.cpp b/src/probe/AudioHapticsProbe.cpp
+new file mode 100644
+index 0000000..50a0753
+--- /dev/null
++++ b/src/probe/AudioHapticsProbe.cpp
+@@ -0,0 +1,203 @@
++// Identifies which controller interface actually drives the haptic actuators,
++// and prints what distinguishes it.
++//
++// Accepting a write is not proof of being wired to anything: four of the five
++// vendor collections accept a stream report, and only one moves the pad. The
++// engine used to take the first that answered, which is a guess - and on this
++// hardware the wrong one. This dumps each interface's HID capabilities so the
++// right one can be selected by a stable property rather than by ordinal.
++//
++// Build: cmake --build build/release --config Release --target AudioHapticsProbe
++// Run:   build\release\Release\AudioHapticsProbe.exe [rate] [--caps-only]
++
++#include <windows.h>
++
++#include <hidsdi.h>
++#include <timeapi.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "../hid/HidDevice.h"
++
++namespace {
++
++constexpr uint16_t kVendor = 0x28DE;
++constexpr uint16_t kPids[] = {0x1302, 0x1303, 0x1304};
++constexpr uint16_t kVendorUsagePage = 0xFF00;
++constexpr uint8_t  kPcmMode = 0x86;
++constexpr uint8_t  kStream  = 0x88;
++
++uint8_t LinearToMuLaw(int16_t sample) {
++    constexpr int kBias = 0x84;
++    constexpr int kClip = 32635;
++    int value = sample;
++    const int sign = (value >> 8) & 0x80;
++    if (sign != 0) value = -value;
++    if (value > kClip) value = kClip;
++    value += kBias;
++    int exponent = 7;
++    for (int mask = 0x4000; (value & mask) == 0 && exponent > 0; mask >>= 1) --exponent;
++    const int mantissa = (value >> (exponent + 3)) & 0x0F;
++    return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
++}
++
++void SetPcm(HidDevice& device, bool enable, int rate) {
++    for (uint8_t side : {uint8_t{2}, uint8_t{5}}) {
++        uint8_t report[64] = {};
++        report[0] = kPcmMode;
++        report[1] = enable ? 0x02 : 0x01;
++        report[2] = side;
++        report[3] = enable ? static_cast<uint8_t>(rate == 8000 ? 8 : 9) : 0;
++        device.WriteOutputReport(report, sizeof(report));
++    }
++}
++
++/** Reads the HID capabilities of one interface path, for a discriminator. */
++void PrintCaps(const std::wstring& path, int index) {
++    const HANDLE handle = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++                                      OPEN_EXISTING, 0, nullptr);
++    if (handle == INVALID_HANDLE_VALUE) {
++        std::printf("    [%d] could not open for caps\n", index);
++        return;
++    }
++    PHIDP_PREPARSED_DATA preparsed = nullptr;
++    if (HidD_GetPreparsedData(handle, &preparsed)) {
++        HIDP_CAPS caps{};
++        if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS) {
++            std::printf("    [%d] usage=%04X page=%04X  out=%u in=%u feat=%u\n", index,
++                        caps.Usage, caps.UsagePage, caps.OutputReportByteLength,
++                        caps.InputReportByteLength, caps.FeatureReportByteLength);
++        }
++        HidD_FreePreparsedData(preparsed);
++    }
++    // The interface number is in the path as &mi_NN, and is stable across boots
++    // in a way an enumeration index is not.
++    const size_t at = path.find(L"&mi_");
++    if (at != std::wstring::npos) {
++        std::wprintf(L"         path mi=%.5s  col=%.10s\n", path.c_str() + at + 4,
++                     path.find(L"&col") != std::wstring::npos
++                         ? path.c_str() + path.find(L"&col") + 4
++                         : L"-");
++    }
++    CloseHandle(handle);
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    int rate = 4000;
++    bool capsOnly = false;
++    for (int i = 1; i < argc; ++i) {
++        if (std::strcmp(argv[i], "--caps-only") == 0) capsOnly = true;
++        else rate = std::atoi(argv[i]);
++    }
++
++    std::printf("\nActuator interface identification  (rate %d Hz)\n", rate);
++    std::printf("----------------------------------------------\n");
++
++    std::vector<HidDevice> answered;
++    std::vector<std::wstring> answeredPaths;
++    int found = 0;
++
++    for (uint16_t pid : kPids) {
++        const std::vector<std::wstring> paths =
++            HidDevice::Enumerate(kVendor, pid, kVendorUsagePage);
++        if (!paths.empty()) {
++            std::printf("  pid %04X : %u vendor interface(s)\n", pid,
++                        static_cast<unsigned>(paths.size()));
++        }
++        found += static_cast<int>(paths.size());
++        for (const std::wstring& path : paths) {
++            HidDevice device;
++            if (!device.Open(path)) continue;
++            uint8_t probe[64] = {};
++            probe[0] = kStream;
++            if (!device.WriteOutputReport(probe, sizeof(probe))) {
++                device.Close();
++                continue;
++            }
++            answered.push_back(std::move(device));
++            answeredPaths.push_back(path);
++        }
++    }
++
++    std::printf("\n  found %d, accepted %u\n\n", found,
++                static_cast<unsigned>(answered.size()));
++    std::printf("  capabilities of each ACCEPTED interface:\n");
++    for (size_t i = 0; i < answeredPaths.size(); ++i) {
++        PrintCaps(answeredPaths[i], static_cast<int>(i));
++    }
++
++    if (answered.empty()) {
++        std::printf("\n  Nothing accepted. Untick the haptics box so the bridge releases\n");
++        std::printf("  the device, then run this again.\n\n");
++        return 1;
++    }
++    if (capsOnly) {
++        for (HidDevice& device : answered) device.Close();
++        std::printf("\n");
++        return 0;
++    }
++
++    std::printf("\n  Playing a 2.5 s tone down EACH interface in turn.\n");
++    std::printf("  Note which index you FEEL.\n\n");
++
++    for (size_t index = 0; index < answered.size(); ++index) {
++        std::printf("  >>> interface %u of %u ... ", static_cast<unsigned>(index),
++                    static_cast<unsigned>(answered.size()));
++        std::fflush(stdout);
++
++        HidDevice& device = answered[index];
++        SetPcm(device, false, rate);
++        Sleep(10);
++        SetPcm(device, true, rate);
++        Sleep(200);
++
++        timeBeginPeriod(1);
++        const auto period = std::chrono::microseconds(31000000 / rate);
++        auto next = std::chrono::steady_clock::now();
++        const auto until = next + std::chrono::milliseconds(2500);
++        double phase = 0.0;
++        const double step = 2.0 * 3.14159265358979 * 60.0 / rate;
++        int sent = 0;
++
++        while (std::chrono::steady_clock::now() < until) {
++            uint8_t report[64] = {};
++            report[0] = kStream;
++            report[1] = 31;
++            for (int i = 0; i < 31; ++i) {
++                const auto value = static_cast<int16_t>(std::sin(phase) * 26000.0);
++                phase += step;
++                report[2 + i]  = LinearToMuLaw(value);
++                report[33 + i] = LinearToMuLaw(value);
++            }
++            device.WriteOutputReport(report, sizeof(report));
++            ++sent;
++
++            next += period;
++            const auto now = std::chrono::steady_clock::now();
++            if (now > next + period * 4) { next = now; continue; }
++            const auto coarse = next - std::chrono::milliseconds(1);
++            if (std::chrono::steady_clock::now() < coarse) std::this_thread::sleep_until(coarse);
++            while (std::chrono::steady_clock::now() < next) YieldProcessor();
++        }
++        timeEndPeriod(1);
++
++        SetPcm(device, false, rate);
++        std::printf("%d reports\n", sent);
++        Sleep(800);
++    }
++
++    for (HidDevice& device : answered) device.Close();
++    std::printf("\n  Which index did you feel? That is the one the engine should use.\n\n");
++    return 0;
++}
+diff --git a/src/steam/AudioHaptics.cpp b/src/steam/AudioHaptics.cpp
+new file mode 100644
+index 0000000..72f847f
+--- /dev/null
++++ b/src/steam/AudioHaptics.cpp
+@@ -0,0 +1,627 @@
++#include "AudioHaptics.h"
++
++#include <windows.h>
++
++#include <audioclient.h>
++#include <mmdeviceapi.h>
++#include <mmreg.h>
++#include <timeapi.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++constexpr uint16_t kValveVendor   = 0x28DE;
++// Wired, Bluetooth and puck. Only the wired one carries 16-bit.
++constexpr uint16_t kPidWired      = 0x1302;
++constexpr uint16_t kPidBluetooth  = 0x1303;
++constexpr uint16_t kPidPuck       = 0x1304;
++// The actuators answer on the vendor-defined interface, not the mouse or
++// keyboard collections the pad also exposes in lizard mode.
++constexpr uint16_t kVendorUsagePage = 0xFF00;
++
++constexpr uint8_t kReportPcmMode = 0x86;
++constexpr uint8_t kReportStream  = 0x88;
++constexpr uint8_t kPcmDisable    = 0x01;
++constexpr uint8_t kPcmEnable     = 0x02;
++// The two haptic actuator channels.
++constexpr uint8_t kSideLeft      = 2;
++constexpr uint8_t kSideRight     = 5;
++
++// u-law carries 31 samples per channel in one 64-byte report; 16-bit carries 15.
++constexpr size_t kMuLawSamplesPerReport = 31;
++constexpr size_t kPcm16SamplesPerReport = 15;
++
++// The firmware needs this long between a disable and the following enable.
++constexpr DWORD kPcmSettleMs = 200;
++
++// Retry interval when the audio device went away.
++constexpr auto kRetryDelay = std::chrono::seconds(3);
++
++/** Reads one DWORD tunable, clamped. */
++DWORD ReadSetting(const wchar_t* name, DWORD fallback, DWORD maximum) {
++    DWORD data = 0;
++    DWORD cb   = sizeof(data);
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\SteamlessController", name,
++                     RRF_RT_REG_DWORD, nullptr, &data, &cb) != ERROR_SUCCESS) {
++        return fallback;
++    }
++    return data > maximum ? maximum : data;
++}
++
++/**
++ * G.711 u-law encode. Textbook algorithm, kept here so the transport does not
++ * depend on a codec library for thirteen lines of arithmetic.
++ */
++uint8_t LinearToMuLaw(int16_t sample) {
++    constexpr int kBias = 0x84;
++    constexpr int kClip = 32635;
++    int value = sample;
++    const int sign = (value >> 8) & 0x80;
++    if (sign != 0) value = -value;
++    if (value > kClip) value = kClip;
++    value += kBias;
++    int exponent = 7;
++    for (int mask = 0x4000; (value & mask) == 0 && exponent > 0; mask >>= 1) --exponent;
++    const int mantissa = (value >> (exponent + 3)) & 0x0F;
++    return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
++}
++
++// Band centres. Chosen for what the actuators can reproduce rather than what a
++// speaker can: above roughly 1 kHz a voice coil this size is barely felt, so
++// spending bands up there would waste the interface.
++const float kBandCentres[AudioHaptics::kBandCount] = {30.0f, 60.0f, 120.0f,
++                                                      240.0f, 480.0f, 960.0f};
++
++/**
++ * One second-order bandpass section, constant peak gain.
++ * A parallel bank of these is a graphic EQ: each band is filtered out on its
++ * own and scaled, so setting a band to zero genuinely removes that range
++ * instead of merely turning it down.
++ */
++struct Biquad {
++    float b0{0}, b1{0}, b2{0}, a1{0}, a2{0};
++    float x1{0}, x2{0}, y1{0}, y2{0};
++
++    void SetBandpass(float centreHz, float q, float sampleRate) {
++        if (centreHz >= sampleRate * 0.5f) { b0 = b1 = b2 = a1 = a2 = 0.0f; return; }
++        const float w     = 6.2831853f * centreHz / sampleRate;
++        const float alpha = std::sin(w) / (2.0f * q);
++        const float cosw  = std::cos(w);
++        const float a0    = 1.0f + alpha;
++        b0 =  alpha / a0;
++        b1 =  0.0f;
++        b2 = -alpha / a0;
++        a1 = (-2.0f * cosw) / a0;
++        a2 = (1.0f - alpha) / a0;
++    }
++
++    float Process(float x) {
++        const float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
++        x2 = x1; x1 = x; y2 = y1; y1 = y;
++        return y;
++    }
++};
++
++/** One-pole coefficient for a cutoff in Hz at a sample rate. */
++float OnePole(float cutoffHz, float sampleRate) {
++    if (cutoffHz <= 0.0f || sampleRate <= 0.0f) return 1.0f;
++    const float value = 1.0f - std::exp(-6.2831853f * cutoffHz / sampleRate);
++    return std::clamp(value, 0.0f, 1.0f);
++}
++
++/** Soft-knee limiter, so a loud passage compresses instead of clipping. */
++float SoftLimit(float value) {
++    if (value > 1.0f)  return 1.0f;
++    if (value < -1.0f) return -1.0f;
++    return value - (value * value * value) / 3.0f;
++}
++
++} // namespace
++
++AudioHaptics& AudioHaptics::Instance() {
++    static AudioHaptics instance;
++    return instance;
++}
++
++AudioHaptics::~AudioHaptics() {
++    Stop();
++}
++
++bool AudioHaptics::Enabled() {
++    return ReadSetting(L"HapticAudioMode", 0, 1) != 0;
++}
++
++float AudioHaptics::Gain() {
++    return static_cast<float>(ReadSetting(L"HapticAudioGain", 854, 2000)) / 100.0f;
++}
++
++float AudioHaptics::BandGain(int band) {
++    if (band < 0 || band >= kBandCount) return 0.0f;
++    // Tuned by hand on real hardware, not derived: every band above 120 Hz
++    // is off because nothing up there is felt as texture on these actuators,
++    // and the bottom two sit at maximum because that is where the authority
++    // is. A flat EQ feels like noise; this feels like impact.
++    static const DWORD defaults[kBandCount] = {400, 160, 0, 0, 0, 0};
++    wchar_t name[32];
++    _snwprintf_s(name, _TRUNCATE, L"HapticEqBand%d", band);
++    return static_cast<float>(ReadSetting(name, defaults[band], 400)) / 100.0f;
++}
++
++float AudioHaptics::DelayMs() {
++    return static_cast<float>(ReadSetting(L"HapticAudioDelayMs", 68, 500));
++}
++
++bool AudioHaptics::RumbleGated() {
++    return ReadSetting(L"HapticRumbleGate", 1, 1) != 0;
++}
++
++float AudioHaptics::RumbleReleaseMs() {
++    const DWORD ms = ReadSetting(L"HapticRumbleRelease", 220, 3000);
++    return ms < 20 ? 20.0f : static_cast<float>(ms);
++}
++
++void AudioHaptics::SetRumbleLevel(float level) {
++    // Recorded unconditionally and consulted only when gating is on, so turning
++    // the setting on takes effect on the next rumble rather than the next game.
++    m_rumbleLevel.store(std::clamp(level, 0.0f, 1.0f), std::memory_order_relaxed);
++    m_rumbleAtMs.store(static_cast<long long>(GetTickCount64()), std::memory_order_relaxed);
++}
++
++uint32_t AudioHaptics::Rate() {
++    // Default 4 kHz. A report carries 31 samples, so at 8 kHz one is due every
++    // 3875 us - but a write to the puck takes 4000 us waiting for its radio
++    // slot, so 8 kHz can never be sustained there and the shortfall is felt as
++    // stutter. 4 kHz gives a 7750 us period, which the same write fills to 52%.
++    // Wired is different and its 16-bit mode is chosen separately.
++    return ReadSetting(L"HapticAudioRate", 4000, 8000) >= 6000 ? 8000u : 4000u;
++}
++
++size_t AudioHaptics::LatencyCap() {
++    const size_t cap = ReadSetting(L"HapticAudioLatency", 64, 128);
++    return cap < 4 ? 4 : cap;
++}
++
++void AudioHaptics::SendPcmMode(uint8_t op, uint8_t param) {
++    for (HidDevice& hid : m_actuators) {
++        if (!hid.IsOpen()) continue;
++        for (uint8_t side : {kSideLeft, kSideRight}) {
++            uint8_t report[64] = {};
++            report[0] = kReportPcmMode;
++            report[1] = op;
++            report[2] = side;
++            report[3] = param;
++            hid.WriteOutputReport(report, sizeof(report));
++        }
++    }
++}
++
++/**
++ * The USB interface number from a device path, or a large value when absent.
++ * Paths look like ...&mi_02&col03..., and that number is fixed by the device
++ * descriptor - unlike enumeration order, which is not sorted and differs
++ * between boots.
++ */
++static int InterfaceNumber(const std::wstring& path) {
++    const size_t at = path.find(L"&mi_");
++    if (at == std::wstring::npos) return 0xFF;
++    return static_cast<int>(wcstol(path.c_str() + at + 4, nullptr, 16));
++}
++
++bool AudioHaptics::OpenActuators() {
++    CloseActuators();
++
++    // Several vendor collections accept a stream report and only one is wired
++    // to the actuators, so acceptance alone is not a test. Measured on this
++    // hardware: four accept, and the one that moves the pad is the lowest
++    // interface number. Writing to all four instead costs 16 ms per report
++    // against a 3875 us period, because each write waits for its own radio
++    // slot - which is what made the stream stutter.
++    std::wstring bestPath;
++    int bestInterface = 0x100;
++    uint16_t bestPid = 0;
++
++    for (uint16_t pid : {kPidWired, kPidBluetooth, kPidPuck}) {
++        for (const std::wstring& path :
++             HidDevice::Enumerate(kValveVendor, pid, kVendorUsagePage)) {
++            HidDevice hid;
++            if (!hid.Open(path)) continue;
++            uint8_t probe[64] = {};
++            probe[0] = kReportStream;
++            const bool accepted = hid.WriteOutputReport(probe, sizeof(probe));
++            hid.Close();
++            if (!accepted) continue;
++            const int number = InterfaceNumber(path);
++            if (number < bestInterface) {
++                bestInterface = number;
++                bestPath = path;
++                bestPid = pid;
++            }
++        }
++    }
++
++    if (bestPath.empty()) return false;
++
++    HidDevice chosen;
++    if (!chosen.Open(bestPath)) return false;
++    if (bestPid == kPidWired) m_sixteenBit = true;
++    if (bestPid == kPidBluetooth) m_rate = 4000;
++    m_actuators.push_back(std::move(chosen));
++    return true;
++}
++
++void AudioHaptics::CloseActuators() {
++    for (HidDevice& hid : m_actuators) hid.Close();
++    m_actuators.clear();
++}
++
++bool AudioHaptics::Start() {
++    if (!Enabled()) return false;
++    if (m_running.exchange(true)) return true;
++
++    m_rate = Rate();
++    m_gain.store(Gain());
++    for (int b = 0; b < kBandCount; ++b) m_bands[b].store(BandGain(b));
++    m_rumbleGated.store(RumbleGated());
++    m_delayMs.store(DelayMs());
++    m_latency.store(LatencyCap());
++    if (!OpenActuators()) {
++        printf("AudioHaptics: no controller actuator interface answered.\n");
++        m_running.store(false);
++        return false;
++    }
++
++    // Disable first: the firmware refuses an enable on a channel already in PCM
++    // mode from a previous session that did not shut down cleanly.
++    const uint8_t param = m_sixteenBit ? 0 : static_cast<uint8_t>(m_rate == 8000 ? 8 : 9);
++    SendPcmMode(kPcmDisable, 0);
++    Sleep(10);
++    SendPcmMode(kPcmEnable, param);
++    Sleep(kPcmSettleMs);
++
++    m_interfaceCount.store(static_cast<int>(m_actuators.size()));
++    printf("AudioHaptics: PCM enabled on %u interface(s), %s @ %u Hz.\n",
++           static_cast<unsigned>(m_actuators.size()), m_sixteenBit ? "16-bit" : "u-law", m_rate);
++
++    m_capture = std::thread(&AudioHaptics::CaptureLoop, this);
++    m_sender  = std::thread(&AudioHaptics::SendLoop, this);
++    return true;
++}
++
++void AudioHaptics::Stop() {
++    if (!m_running.exchange(false)) return;
++    if (m_capture.joinable()) m_capture.join();
++    if (m_sender.joinable())  m_sender.join();
++    m_active.store(false, std::memory_order_relaxed);
++    m_interfaceCount.store(0);
++    // Hand the actuators back, or they stay in PCM mode and rumble stays dead.
++    SendPcmMode(kPcmDisable, 0);
++    Sleep(10);
++    CloseActuators();
++    {
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        m_queue.clear();
++    }
++}
++
++void AudioHaptics::SendLoop() {
++    // One report is exactly its sample count at the transport rate: 31 samples
++    // at 8 kHz is 3875 us. Holding that clock is the whole job - the actuators
++    // reproduce a waveform, so a late report is an audible gap, not a delay.
++    const auto period = std::chrono::microseconds(
++        m_sixteenBit ? 1875LL : static_cast<long long>(31'000'000ULL / m_rate));
++
++    // Windows' default timer resolution is about 15.6 ms. sleep_until on a
++    // 3.875 ms period therefore overshoots by whole timer ticks and the stream
++    // arrives in clumps, which is felt as stutter rather than as latency. Ask
++    // for 1 ms and spin the last stretch.
++    timeBeginPeriod(1);
++
++    // Prime before starting the clock. WASAPI hands over roughly 10 ms of audio
++    // at a time, so reports are produced in bursts of two or three; starting on
++    // the first one guarantees an underrun a few milliseconds later.
++    const size_t prime = 4;
++    while (m_running.load()) {
++        size_t queued = 0;
++        {
++            std::lock_guard<std::mutex> lock(m_queueMutex);
++            queued = m_queue.size();
++        }
++        if (queued >= prime) break;
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++
++    auto next = std::chrono::steady_clock::now();
++    while (m_running.load()) {
++        Report report{};
++        bool have = false;
++        {
++            std::lock_guard<std::mutex> lock(m_queueMutex);
++            if (!m_queue.empty()) {
++                report = m_queue.front();
++                m_queue.erase(m_queue.begin());
++                have = true;
++            }
++        }
++
++        if (have) {
++            for (HidDevice& hid : m_actuators) {
++                if (hid.IsOpen()) hid.WriteOutputReport(report.data(), report.size());
++            }
++        }
++        // The clock advances whether or not a report was ready. An underrun is
++        // one missing packet, not a reason to restart the cadence - resetting it
++        // on every gap is what turns a brief starve into permanent judder.
++        next += period;
++
++        const auto now = std::chrono::steady_clock::now();
++        if (now > next + period * 4) {
++            // Genuinely far behind: resynchronise rather than burst-send to
++            // catch up, which would flood the firmware.
++            next = now;
++            continue;
++        }
++        // Sleep the coarse part, spin the last millisecond. The spin is bounded
++        // by the period, so it costs well under 1% of a core at this rate.
++        const auto coarse = next - std::chrono::milliseconds(1);
++        if (std::chrono::steady_clock::now() < coarse) {
++            std::this_thread::sleep_until(coarse);
++        }
++        while (std::chrono::steady_clock::now() < next) {
++            YieldProcessor();
++        }
++    }
++
++    timeEndPeriod(1);
++}
++
++void AudioHaptics::CaptureLoop() {
++    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
++    const bool ownsCom = SUCCEEDED(comInit);
++    while (m_running.load()) {
++        RunCaptureSession();
++        if (!m_running.load()) break;
++        m_active.store(false, std::memory_order_relaxed);
++        std::this_thread::sleep_for(kRetryDelay);
++    }
++    if (ownsCom) CoUninitialize();
++}
++
++void AudioHaptics::RunCaptureSession() {
++    IMMDeviceEnumerator* enumerator = nullptr;
++    IMMDevice*           endpoint   = nullptr;
++    IAudioClient*        client     = nullptr;
++    IAudioCaptureClient* capture    = nullptr;
++    WAVEFORMATEX*        format     = nullptr;
++
++    const auto release = [&]() {
++        if (capture)    capture->Release();
++        if (client)     client->Release();
++        if (endpoint)   endpoint->Release();
++        if (enumerator) enumerator->Release();
++        if (format)     CoTaskMemFree(format);
++    };
++
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
++                                __uuidof(IMMDeviceEnumerator),
++                                reinterpret_cast<void**>(&enumerator)))
++        || FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &endpoint))
++        || FAILED(endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
++                                     reinterpret_cast<void**>(&client)))
++        || FAILED(client->GetMixFormat(&format))) {
++        release();
++        return;
++    }
++
++    const bool extensible = format->wFormatTag == WAVE_FORMAT_EXTENSIBLE;
++    const bool isFloat =
++        format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT
++        || (extensible && format->cbSize >= 22
++            && reinterpret_cast<WAVEFORMATEXTENSIBLE*>(format)->SubFormat.Data1
++                   == WAVE_FORMAT_IEEE_FLOAT);
++    const bool isPcm16 = !isFloat && format->wBitsPerSample == 16;
++    if (!isFloat && !isPcm16) {
++        release();
++        return;
++    }
++
++    if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
++                                  100'000, 0, format, nullptr))
++        || FAILED(client->GetService(__uuidof(IAudioCaptureClient),
++                                     reinterpret_cast<void**>(&capture)))
++        || FAILED(client->Start())) {
++        release();
++        return;
++    }
++
++    const float    sampleRate = static_cast<float>(format->nSamplesPerSec);
++    const uint32_t channels   = format->nChannels == 0 ? 1u : format->nChannels;
++    // Decimation ratio to the transport rate. Anything above the transport's
++    // Nyquist has to go before decimating, or it aliases down into the band we
++    // can actually feel, which reads as grit rather than bass.
++    const float    ratio      = sampleRate / static_cast<float>(m_rate);
++    const float    antiAlias  = OnePole(static_cast<float>(m_rate) * 0.45f, sampleRate);
++    // One bank per channel. Q of 1.1 gives bands that overlap slightly, so a
++    // sweep across them is continuous rather than stepped.
++    Biquad leftBank[kBandCount];
++    Biquad rightBank[kBandCount];
++    for (int b = 0; b < kBandCount; ++b) {
++        leftBank[b].SetBandpass(kBandCentres[b], 1.1f, sampleRate);
++        rightBank[b].SetBandpass(kBandCentres[b], 1.1f, sampleRate);
++    }
++    const float releaseMs = RumbleReleaseMs();
++
++    // Delay line on the decimated stream. One second of headroom at 8 kHz is
++    // ample for the 500 ms ceiling and costs 32 KB.
++    const size_t delayCapacity = 8000;
++    std::vector<float> delayLeft(delayCapacity, 0.0f);
++    std::vector<float> delayRight(delayCapacity, 0.0f);
++    size_t delayWrite = 0;
++    // Read per sample below, not captured here, so a slider moves the feel now.
++    const size_t   perReport  = m_sixteenBit ? kPcm16SamplesPerReport : kMuLawSamplesPerReport;
++
++    float leftLp = 0.0f, rightLp = 0.0f;
++    float accumulator = 0.0f;
++    Report report{};
++    report[0] = kReportStream;
++    size_t filled = 0;
++
++    m_active.store(true, std::memory_order_relaxed);
++
++    while (m_running.load()) {
++        UINT32 packet = 0;
++        if (FAILED(capture->GetNextPacketSize(&packet))) break;
++        if (packet == 0) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(2));
++            continue;
++        }
++        BYTE*  data   = nullptr;
++        UINT32 frames = 0;
++        DWORD  flags  = 0;
++        if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
++        const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr;
++
++        for (UINT32 i = 0; i < frames; ++i) {
++            float left = 0.0f, right = 0.0f;
++            if (!silent) {
++                const size_t base = static_cast<size_t>(i) * channels;
++                if (isFloat) {
++                    const float* samples = reinterpret_cast<const float*>(data);
++                    left  = samples[base];
++                    right = channels > 1 ? samples[base + 1] : samples[base];
++                } else {
++                    const int16_t* samples = reinterpret_cast<const int16_t*>(data);
++                    left  = static_cast<float>(samples[base]) / 32768.0f;
++                    right = static_cast<float>(channels > 1 ? samples[base + 1] : samples[base])
++                            / 32768.0f;
++                }
++            }
++
++            // Graphic EQ: filter each band out on its own and sum them back
++            // with its own level. A band set to zero contributes nothing at all,
++            // which a shelf could never do.
++            float shapedLeft = 0.0f, shapedRight = 0.0f;
++            for (int b = 0; b < kBandCount; ++b) {
++                const float level = m_bands[b].load(std::memory_order_relaxed);
++                if (level <= 0.0f) {
++                    // Still run the filter: its state has to stay continuous or
++                    // re-enabling the band clicks.
++                    leftBank[b].Process(left);
++                    rightBank[b].Process(right);
++                    continue;
++                }
++                shapedLeft  += leftBank[b].Process(left) * level;
++                shapedRight += rightBank[b].Process(right) * level;
++            }
++            left  = shapedLeft;
++            right = shapedRight;
++
++            leftLp  += antiAlias * (left - leftLp);
++            rightLp += antiAlias * (right - rightLp);
++
++            accumulator += 1.0f;
++            if (accumulator < ratio) continue;
++            accumulator -= ratio;
++
++            // Delay the AUDIO, never the response.
++            //
++            // The delay line carries the raw band-shaped waveform and nothing
++            // else. Gain and the rumble gate are applied AFTER it, against the
++            // clock as it is now - so an impact opens the gate the instant the
++            // game asks, while the sound it lets through is the one that lines
++            // up with the speakers. Applying the gate before the line, as this
++            // did at first, delayed the response along with the audio and made
++            // every hit late by whatever the slider said.
++            delayLeft[delayWrite]  = leftLp;
++            delayRight[delayWrite] = rightLp;
++            size_t offset = static_cast<size_t>(m_delayMs.load(std::memory_order_relaxed)
++                                                * static_cast<float>(m_rate) / 1000.0f);
++            if (offset >= delayCapacity) offset = delayCapacity - 1;
++            const size_t readAt = (delayWrite + delayCapacity - offset) % delayCapacity;
++            const float delayedLeft  = delayLeft[readAt];
++            const float delayedRight = delayRight[readAt];
++            delayWrite = (delayWrite + 1) % delayCapacity;
++
++            float gain = m_gain.load(std::memory_order_relaxed);
++            if (m_rumbleGated.load(std::memory_order_relaxed)) {
++                // The game says WHEN, the audio says WHAT. Outside a rumble
++                // request the pad is silent, so ambient music no longer buzzes
++                // continuously; during one, the texture comes from the sound
++                // rather than from a motor byte.
++                const auto now = static_cast<long long>(GetTickCount64());
++                const long long since = now - m_rumbleAtMs.load(std::memory_order_relaxed);
++                const float level = m_rumbleLevel.load(std::memory_order_relaxed);
++                float envelope = 0.0f;
++                if (level > 0.0f && since >= 0) {
++                    envelope = 1.0f - static_cast<float>(since) / releaseMs;
++                    if (envelope < 0.0f) envelope = 0.0f;
++                    envelope *= level;
++                }
++                gain *= envelope;
++            }
++            const float l = SoftLimit(delayedLeft * gain);
++            const float r = SoftLimit(delayedRight * gain);
++            const auto li = static_cast<int16_t>(std::clamp(l, -1.0f, 1.0f) * 32767.0f);
++            const auto ri = static_cast<int16_t>(std::clamp(r, -1.0f, 1.0f) * 32767.0f);
++
++            if (m_sixteenBit) {
++                report[2 + filled * 2]  = static_cast<uint8_t>(li & 0xFF);
++                report[3 + filled * 2]  = static_cast<uint8_t>((li >> 8) & 0xFF);
++                report[33 + filled * 2] = static_cast<uint8_t>(ri & 0xFF);
++                report[34 + filled * 2] = static_cast<uint8_t>((ri >> 8) & 0xFF);
++            } else {
++                report[2 + filled]  = LinearToMuLaw(li);
++                report[33 + filled] = LinearToMuLaw(ri);
++            }
++            ++filled;
++
++            if (filled >= perReport) {
++                report[1] = static_cast<uint8_t>(m_sixteenBit ? 30 : perReport);
++                {
++                    std::lock_guard<std::mutex> lock(m_queueMutex);
++                    // Drop the oldest rather than grow: late haptics are worse
++                    // than missing ones, and an unbounded queue becomes delay.
++                    if (m_queue.size() >= m_latency.load(std::memory_order_relaxed))
++                        m_queue.erase(m_queue.begin());
++                    m_queue.push_back(report);
++                }
++                report = Report{};
++                report[0] = kReportStream;
++                filled = 0;
++            }
++        }
++        capture->ReleaseBuffer(frames);
++    }
++
++    m_active.store(false, std::memory_order_relaxed);
++    client->Stop();
++    release();
++}
++
++void AudioHaptics::Reload() {
++    // Gain, bass and latency are live: the capture loop reads them per sample,
++    // so a slider is felt before it is released.
++    m_gain.store(Gain(), std::memory_order_relaxed);
++    for (int b = 0; b < kBandCount; ++b)
++        m_bands[b].store(BandGain(b), std::memory_order_relaxed);
++    m_rumbleGated.store(RumbleGated(), std::memory_order_relaxed);
++    m_delayMs.store(DelayMs(), std::memory_order_relaxed);
++    m_latency.store(LatencyCap(), std::memory_order_relaxed);
++
++    // The enable flag and the transport rate are structural - they decide
++    // whether a stream exists at all and at what clock - so they restart it.
++    const bool wanted = Enabled();
++    const bool running = m_running.load();
++    if (wanted && running && Rate() != m_rate) {
++        Stop();
++        Start();
++        return;
++    }
++    if (wanted && !running) Start();
++    if (!wanted && running) Stop();
++}
+diff --git a/src/steam/AudioHaptics.h b/src/steam/AudioHaptics.h
+new file mode 100644
+index 0000000..a7ace89
+--- /dev/null
++++ b/src/steam/AudioHaptics.h
+@@ -0,0 +1,135 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#include "../hid/HidDevice.h"
++
++// Streams system audio to the Steam Controller's haptic actuators as PCM, so
++// the actuators reproduce the sound rather than buzzing in time with it.
++//
++// Why not rumble: XInput carries two motor bytes and a game sends them on
++// discrete events. Driving those bytes from an audio envelope is still only an
++// intensity, and on voice-coil actuators it reads as a weak hum. The firmware
++// has a real path - a PCM mode on the two actuator channels - and that is what
++// the "music through a Steam Controller" demos use.
++//
++// Protocol credit: the report layout and timing below were established by
++// LiveHaptics (FamBoy32-dev/steam-controller-live-haptics, MIT) and
++// SteamHapticsPlayer (Pixel1011). This is an independent implementation of the
++// same documented protocol.
++//
++//   0x86  [0x86, op, side, param]   op 1 = disable, 2 = enable
++//                                   side 2 and 5 are the two actuators
++//                                   param 0 = 16-bit, 8 = 8 kHz u-law, 9 = 4 kHz
++//   0x88  64-byte report: [1] = sample count,
++//                         left channel at 2 + i, right at 33 + i (u-law)
++//   rate  one report every 31,000,000 / rate microseconds (3875 us at 8 kHz)
++//
++// While this is streaming, normal rumble is suppressed: both drive the same
++// actuators, and a motor command on top of a waveform produces neither.
++//
++// Scope: runs only while this process owns the controller. Inside a Steam game
++// Steam Input holds the device, which is the same exclusivity that shapes the
++// rest of this application.
++class AudioHaptics {
++public:
++    static AudioHaptics& Instance();
++
++    // Opens its own handles to the vendor interfaces, enables PCM mode and
++    // starts capture. False when disabled by settings or no controller answered.
++    bool Start();
++    void Stop();
++
++    // True while PCM is streaming. Rumble is suppressed for exactly this long.
++    bool Active() const { return m_active.load(std::memory_order_relaxed); }
++
++    // Re-reads every tunable from the registry and applies it live. Gain, bass
++    // and latency take effect on the next report; a change to the enable flag or
++    // the transport rate restarts the stream. The settings window calls this, so
++    // nothing there ever asks the user to restart the application.
++    void Reload();
++
++    // How many actuator interfaces accepted the stream probe. Zero while
++    // stopped, and the number the settings window reports.
++    int InterfaceCount() const { return m_interfaceCount.load(std::memory_order_relaxed); }
++
++    // --- settings, read once at startup, HKCU\Software\SteamlessController ---
++
++    // HapticAudioMode: 0 = off (default), 1 = stream audio to the actuators.
++    static bool Enabled();
++    // HapticAudioGain: loudness in percent. Default 200.
++    static float Gain();
++    // HapticEqBandN: per-band level in percent, 0 removes the band entirely.
++    // Six bands centred at 30, 60, 120, 240, 480 and 960 Hz - the range the
++    // actuators can actually reproduce, not the range a speaker can.
++    static constexpr int kBandCount = 6;
++    static float BandGain(int band);
++
++    // HapticRumbleGate: 0 = always stream (default), 1 = only while the game is
++    // asking for rumble. On, audio supplies the texture and the game supplies
++    // the timing, so ambient music does not buzz the pad all the time.
++    static bool RumbleGated();
++    // HapticRumbleRelease: milliseconds the gate takes to fall. Default 220.
++    static float RumbleReleaseMs();
++
++    // HapticAudioDelayMs: hold the haptics back to line up with the speakers.
++    // Loopback taps the stream before the endpoint buffer and the DAC, so the
++    // pad is genuinely ahead of what you hear. Default 0, up to 500.
++    static float DelayMs();
++
++    // Called from the rumble path with the requested motor level, 0..1. Ignored
++    // unless gating is on.
++    void SetRumbleLevel(float level);
++    // HapticAudioRate: 8000 or 4000. Default 8000.
++    static uint32_t Rate();
++    // HapticAudioLatency: queued reports before the oldest is dropped. Default 16.
++    static size_t LatencyCap();
++
++private:
++    AudioHaptics() = default;
++    ~AudioHaptics();
++    AudioHaptics(const AudioHaptics&)            = delete;
++    AudioHaptics& operator=(const AudioHaptics&) = delete;
++
++    // One 64-byte 0x88 report.
++    using Report = std::array<uint8_t, 64>;
++
++    bool OpenActuators();
++    void CloseActuators();
++    // op 1 disables, op 2 enables; sent to both actuator channels.
++    void SendPcmMode(uint8_t op, uint8_t param);
++
++    void CaptureLoop();   // WASAPI loopback -> DSP -> decimate -> u-law -> queue
++    void SendLoop();      // drains the queue onto the wire at the sample clock
++    void RunCaptureSession();
++
++    std::vector<HidDevice> m_actuators;
++
++    std::thread       m_capture;
++    std::thread       m_sender;
++    std::atomic<bool> m_running{false};
++    std::atomic<bool> m_active{false};
++    // The wired controller (pid 0x1302) carries 16-bit instead of u-law.
++    bool              m_sixteenBit{false};
++    uint32_t          m_rate{8000};
++
++    // Read live by the capture loop so the settings window takes effect at once.
++    std::atomic<float>  m_gain{2.0f};
++    std::atomic<float>  m_delayMs{0.0f};
++    std::atomic<float>  m_bands[kBandCount]{};
++    std::atomic<bool>   m_rumbleGated{false};
++    // Latest rumble request and when it arrived, so the gate can fall smoothly
++    // rather than cutting the waveform off mid-cycle.
++    std::atomic<float>  m_rumbleLevel{0.0f};
++    std::atomic<long long> m_rumbleAtMs{0};
++    std::atomic<size_t> m_latency{16};
++    std::atomic<int>    m_interfaceCount{0};
++
++    std::mutex          m_queueMutex;
++    std::vector<Report> m_queue;
++};
+diff --git a/src/steam/SteamController.cpp b/src/steam/SteamController.cpp
+index 3711f3f..fd7752e 100644
+--- a/src/steam/SteamController.cpp
++++ b/src/steam/SteamController.cpp
+@@ -1,4 +1,5 @@
+ #include "SteamController.h"
++#include "AudioHaptics.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+@@ -122,6 +123,7 @@ bool SteamController::Open(const std::wstring& path) {
+ void SteamController::Close() {
+     if (m_running.exchange(false) && m_rumbleThread.joinable())
+         m_rumbleThread.join();
++    AudioHaptics::Instance().Stop();
+     ClearTrackpadHaptics();
+     SetRumble(0, 0);
+     m_device.Close();
+@@ -216,8 +218,12 @@ bool SteamController::DisableLizardMode() {
+         }
+     }
+ 
+-    if (!m_running.exchange(true))
++    if (!m_running.exchange(true)) {
+         m_rumbleThread = std::thread(&SteamController::RumbleLoop, this);
++        // Only meaningful while this process owns the pad, so it shares the
++        // rumble thread's lifetime exactly. No-ops unless HapticAudioMode is on.
++        AudioHaptics::Instance().Start();
++    }
+ 
+     return true;
+ }
+@@ -249,6 +255,7 @@ void SteamController::EmergencyLizardRestore() noexcept {
+ bool SteamController::EnableLizardMode() {
+     if (m_running.exchange(false) && m_rumbleThread.joinable())
+         m_rumbleThread.join();
++    AudioHaptics::Instance().Stop();
+ 
+     ClearTrackpadHaptics();
+     SetRumble(0, 0);
+@@ -313,6 +320,14 @@ void SteamController::SetRumble(uint8_t largeMotor, uint8_t smallMotor) {
+     const double low  = MotorByteToUnit(largeMotor);
+     const double high = MotorByteToUnit(smallMotor);
+ 
++    // Every rumble request is reported to the haptics engine, whether or not it
++    // is gating on them. The game is the only thing that knows when something
++    // worth feeling happened - audio knows what it sounded like, not whether it
++    // was aimed at the player. Gating on this is what separates an explosion
++    // from the soundtrack.
++    AudioHaptics::Instance().SetRumbleLevel(
++        static_cast<float>(low > high ? low : high));
++
+     const double leftDemand  = ClampUnit(low * 1.00 + high * 0.30);
+     const double rightDemand = ClampUnit(low * 0.78 + high * 0.88);
+     const uint16_t baseLeft  = UnitToHapticSpeed(leftDemand,  0x1200);
+@@ -418,6 +433,19 @@ void SteamController::ClearTrackpadHaptics() {
+ bool SteamController::SendRumbleOutput(uint16_t leftSpeed, uint16_t rightSpeed) {
+     if (!m_device.IsOpen()) return false;
+ 
++    // PCM audio haptics own the actuators while streaming, so every rumble
++    // write is dropped here rather than at each call site. There were two call
++    // sites - the rumble thread and SetRumble's own immediate write - and
++    // gating only the first left game rumble fully audible. This is the one
++    // function that puts a motor command on the wire, so gating it is the only
++    // version that a new caller cannot quietly bypass.
++    //
++    // A stop still goes through: it is how the motors are silenced on the way
++    // into PCM mode, and silencing them must never be the thing that is blocked.
++    if ((leftSpeed != 0 || rightSpeed != 0) && AudioHaptics::Instance().Active()) {
++        return true;
++    }
++
+     uint8_t buf[10] = {};
+     buf[0] = OUT_HAPTIC_RUMBLE;
+     buf[1] = 0x00;
+@@ -467,7 +495,26 @@ bool SteamController::SendTrackpadCommandOutput(uint8_t side, uint8_t command, i
+ // ---------------------------------------------------------------------------
+ 
+ void SteamController::RumbleLoop() {
++    // True while the previous pass suppressed rumble, so the motors are stopped
++    // exactly once on the way into PCM mode rather than every pass.
++    bool suppressed = false;
++
+     while (m_running.load()) {
++        // PCM audio haptics drive the same two actuators. A rumble command on
++        // top of a waveform produces neither, so rumble is suppressed outright
++        // for as long as audio is streaming - this is the "disable normal
++        // rumble" half of the feature, and it is enforced here rather than by
++        // asking every caller to check.
++        if (AudioHaptics::Instance().Active()) {
++            if (!suppressed) {
++                SendRumbleOutput(0, 0);
++                suppressed = true;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(40));
++            continue;
++        }
++        suppressed = false;
++
+         RumbleFrame frame{};
+         {
+             std::lock_guard<std::mutex> lock(m_rumbleMutex);
+diff --git a/src/steam/SteamController.h b/src/steam/SteamController.h
+index 63f02a9..5266863 100644
+--- a/src/steam/SteamController.h
++++ b/src/steam/SteamController.h
+@@ -81,7 +81,12 @@ public:
+     static constexpr uint8_t BTN_B        = 0x02;  // bit 1
+     static constexpr uint8_t BTN_X        = 0x04;  // bit 2
+     static constexpr uint8_t BTN_Y        = 0x08;  // bit 3
+-    // bit 4 (0x10): TBD
++    // bit 4 — the "..." button between the trackpads, SteamOS's Quick Access
++    // Menu. Identified 2026-09-21 by logging undecoded bits and pressing it:
++    // eleven clean 0x10 press/release pairs, no other bit moving. It had been
++    // reporting correctly all along with nothing listening, so the button did
++    // nothing at all.
++    static constexpr uint8_t BTN_QUICK_ACCESS = 0x10;
+     static constexpr uint8_t BTN_RS       = 0x20;  // bit 5 — right stick click
+     static constexpr uint8_t BTN_MENU     = 0x40;  // bit 6 — ≡ Menu / Start
+     static constexpr uint8_t BTN_R4       = 0x80;  // bit 7 — back paddle R4

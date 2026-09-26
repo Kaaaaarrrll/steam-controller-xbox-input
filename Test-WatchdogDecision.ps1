@@ -13,63 +13,64 @@ if (-not $env:LOCALAPPDATA) {
 
 $cases = @(
     @{ n='Boot: nothing running, pad attached -> start bridge'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$true;HadGame=$false;NoGameSeconds=0}
+       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$false;ControllerPresent=$true}
        e='StartBridge' }
 
     @{ n='Boot: pad not attached yet -> wait, do not spawn bridge'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$false;HadGame=$false;NoGameSeconds=0}
+       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$false;ControllerPresent=$false}
        e='None' }
 
     @{ n='Steady state in Xbox UI: bridge up, no Steam -> nothing to do'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$true;SteamForeground=$false;ControllerPresent=$true;HadGame=$false;NoGameSeconds=0}
+       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
        e='None' }
 
-    @{ n='Steam just launched while bridge holds the pad -> release it'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$true;SteamForeground=$true;ControllerPresent=$true;HadGame=$false;NoGameSeconds=1}
-       e='StopBridge' }
+    @{ n='Steam open but no game, bridge holds the pad -> keep it (Big Picture reads the virtual pad)'
+       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
+       e='None' }
 
     @{ n='Steam game running -> hands off, let Steam Input drive'
-       a=@{SteamRunning=$true;GameRunning=$true;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$true;HadGame=$true;NoGameSeconds=0}
+       a=@{SteamRunning=$true;GameRunning=$true;BridgeRunning=$false;ControllerPresent=$true}
        e='None' }
 
-    @{ n='Game just exited, inside grace window -> wait (user may launch another)'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$true;ControllerPresent=$true;HadGame=$true;NoGameSeconds=5}
-       e='None' }
-
-    @{ n='Game exited but Big Picture is focused -> leave Steam alone, you are picking the next game'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$true;ControllerPresent=$true;HadGame=$true;NoGameSeconds=25}
-       e='None' }
-
-    @{ n='Game exited, Steam left in the background, grace elapsed -> quit Steam so the pad comes back'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$true;HadGame=$true;NoGameSeconds=25}
-       e='StopSteam' }
-
-    @{ n='Game exited, Steam backgrounded but still inside grace -> wait it out'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$true;HadGame=$true;NoGameSeconds=5}
-       e='None' }
-
-    @{ n='Browsing Big Picture, no game yet, Steam focused -> leave Steam alone'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$true;ControllerPresent=$true;HadGame=$false;NoGameSeconds=600}
-       e='None' }
-
-    @{ n='Steam opened but abandoned in the background -> quit it after the idle timeout'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$true;HadGame=$false;NoGameSeconds=130}
-       e='StopSteam' }
-
-    @{ n='Steam in background but under the idle timeout -> leave it'
-       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;SteamForeground=$false;ControllerPresent=$true;HadGame=$false;NoGameSeconds=60}
-       e='None' }
+    @{ n='THE SCENARIO: game exited, Steam still open, back in the Xbox app -> bridge takes the pad back'
+       a=@{SteamRunning=$true;GameRunning=$false;BridgeRunning=$false;ControllerPresent=$true}
+       e='StartBridge' }
 
     @{ n='Bridge respawned during a Steam game -> kill it (this is the pad-stealing case)'
-       a=@{SteamRunning=$true;GameRunning=$true;BridgeRunning=$true;SteamForeground=$false;ControllerPresent=$true;HadGame=$true;NoGameSeconds=0}
+       a=@{SteamRunning=$true;GameRunning=$true;BridgeRunning=$true;ControllerPresent=$true}
        e='StopBridge' }
 
     @{ n='Steam closed, bridge already back -> nothing to do'
-       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$true;SteamForeground=$false;ControllerPresent=$true;HadGame=$false;NoGameSeconds=0}
+       a=@{SteamRunning=$false;GameRunning=$false;BridgeRunning=$true;ControllerPresent=$true}
        e='None' }
 )
 
+# The watchdog closed Steam for nine days before anyone connected the two, because
+# the symptom - Steam vanishing - looks nothing like a controller tool. So this is
+# not one case among the others: it sweeps the whole input space and asserts that
+# no combination of observations can ever produce an action that closes Steam.
+$closeSteamEscapes = @()
+foreach ($steam in @($true, $false)) {
+  foreach ($game in @($true, $false)) {
+    foreach ($bridge in @($true, $false)) {
+      foreach ($pad in @($true, $false)) {
+        $d = Get-WatchdogDecision -SteamRunning $steam -GameRunning $game `
+                                  -BridgeRunning $bridge -ControllerPresent $pad
+        if ($d.Action -notin @('None', 'StartBridge', 'StopBridge')) {
+            $closeSteamEscapes += "$steam/$game/$bridge/$pad -> $($d.Action)"
+        }
+      }
+    }
+  }
+}
+
 $pass = 0; $fail = 0
+if ($closeSteamEscapes.Count -eq 0) {
+    $pass++; Write-Host "  PASS  No input combination can close Steam (16 combinations swept)" -ForegroundColor Green
+} else {
+    $fail++
+    Write-Host ("  FAIL  Something can still close Steam:`n        {0}" -f ($closeSteamEscapes -join "`n        ")) -ForegroundColor Red
+}
 foreach ($c in $cases) {
     $splat = $c.a
     $d = Get-WatchdogDecision @splat
@@ -105,13 +106,12 @@ foreach ($c in $xboxChecks) {
 }
 
 # --------------------------------------------------------------- startup tests
-# The scheduled task restarts this script after a crash. A restart that lands
-# mid-game must not force-quit Steam out from under the running game.
+# Steam already running at startup just means the bridge waits its turn.
 $startupChecks = @(
     @{ n='Startup with no Steam -> nothing to clean up'
        got=(Get-StartupAction -SteamRunning $false -GameRunning $false); e='None' }
-    @{ n='Startup with leftover Steam, no game -> shut it down'
-       got=(Get-StartupAction -SteamRunning $true  -GameRunning $false); e='StopSteam' }
+    @{ n='Startup with Steam already up, no game -> leave it (was: shut it down)'
+       got=(Get-StartupAction -SteamRunning $true  -GameRunning $false); e='None' }
     @{ n='Restart lands mid-game -> adopt it, never kill Steam under a game'
        got=(Get-StartupAction -SteamRunning $true  -GameRunning $true);  e='AdoptGame' }
 )
@@ -165,16 +165,16 @@ foreach ($c in $probeChecks) {
 # and the watchdog can never start the bridge. Includes a BOM, because that is
 # exactly how Set-Content -Encoding UTF8 writes files on PowerShell 5.1.
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) 'steampad-config-test.json'
-$body = '{"BridgeExe":"C:\\Program Files\\SteamlessController\\SteamlessController.exe","GraceAfterGameSeconds":45,"FocusXboxAfterSteam":false}'
+$body = '{"BridgeExe":"C:\\Program Files\\SteamlessController\\SteamlessController.exe","PollMilliseconds":45,"ReturnToXboxAfterGame":false}'
 [System.IO.File]::WriteAllText($tmp, $body, (New-Object System.Text.UTF8Encoding($true)))   # $true = with BOM
 
 . (Join-Path $PSScriptRoot 'SteamPadWatchdog.ps1') -ConfigPath $tmp
 
 $configChecks = @(
     @{ n='BOM-prefixed config still parses';       got=$Config.BridgeExe;             e='C:\Program Files\SteamlessController\SteamlessController.exe' }
-    @{ n='Override wins over default';             got=[int]$Config.GraceAfterGameSeconds; e=45 }
-    @{ n='Boolean override survives round-trip';   got=[bool]$Config.FocusXboxAfterSteam;  e=$false }
-    @{ n='Unspecified key falls back to default';  got=[int]$Config.IdleBrowseSeconds;     e=120 }
+    @{ n='Override wins over default';             got=[int]$Config.PollMilliseconds;        e=45 }
+    @{ n='Boolean override survives round-trip';   got=[bool]$Config.ReturnToXboxAfterGame;  e=$false }
+    @{ n='Unspecified key falls back to default';  got=[int]$Config.BridgeStartDelaySeconds; e=3 }
 )
 foreach ($c in $configChecks) {
     if ($c.got -eq $c.e) { $pass++; Write-Host ("  PASS  {0}" -f $c.n) -ForegroundColor Green }

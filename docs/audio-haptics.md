@@ -109,42 +109,47 @@ restart anything.
 ## Defaults, and why they look extreme
 
 ```
-Strength   1250%      EQ  30 Hz 400%   60 Hz 400%   120 Hz 160%   240+ off
-Delay        76 ms    Buffer  64       Rate  4 kHz  Gate  on
+Enabled   off (opt-in)
+Strength   854%       EQ  30 Hz 400%   60 Hz 160%   120 Hz and up off
+Delay       68 ms     Buffer  64       Rate  4 kHz  Gate  on
 ```
 
-Tuned by hand on real hardware, not derived.
+Tuned by hand on real hardware, not derived. Every value is set from the **Audio Haptics** tab
+of the settings window and applies live.
+
+**Off until you turn it on**, because it replaces the game's own rumble.
 
 **Strength is high because loopback capture is post-volume.** Ordinary playback measures
 around **0.035 peak** (about -29 dBFS), so a sane-looking gain of 200% produces roughly 6%
 drive — below the level an actuator is felt at.
 
-**Everything above 120 Hz is off** because nothing up there reads as texture on these
+**Everything from 120 Hz up is off** because nothing up there reads as texture on these
 actuators. A flat EQ feels like noise.
 
 **The gate is on** because it is the better experience in a game: the game supplies the
-timing, the audio supplies the texture. It also means the pad is silent until something
-happens, which can look broken — the settings window says so explicitly in that state.
+timing, the audio supplies the texture. It also means **the pad is silent until the game asks
+for rumble** — on the desktop, or in a game that never rumbles, that looks exactly like
+haptics not working. To feel it on anything, untick *Only while the game asks for rumble*.
 
 ## Files
 
 | | |
 |---|---|
-| `AudioHaptics.{h,cpp}` | capture, DSP, transport, rumble gate |
-| `HapticsWindow.{h,cpp}` | the settings window (plain Win32, DPI-aware, live) |
-| `AudioHapticsProbe.cpp` | identifies the working interface and measures the transport |
-| `integration.patch` | the changes to `SteamController.cpp`, `TrayApp`, `CMakeLists.txt` |
+All of it ships in one patch,
+[`steamlesscontroller-patches/steamlesscontroller-1.17.patch`](../steamlesscontroller-patches/steamlesscontroller-1.17.patch):
+
+| | |
+|---|---|
+| `src/steam/AudioHaptics.{h,cpp}` | capture, DSP, transport, rumble gate |
+| `src/app/RemapWindow.cpp` | the **Audio Haptics** tab of the settings window (live, no restart) |
+| `src/steam/SteamController.cpp` | the rumble gate at `SendRumbleOutput`, rumble level reporting |
+| `src/probe/AudioHapticsProbe.cpp` | identifies the working interface and measures the transport |
 
 ## Building
 
-Drop the sources into a SteamlessController checkout, apply `integration.patch`, and build:
-
-```
-cmake --preset release
-cmake --build build/release --config Release
-```
-
-`SteamController` needs `ole32 winmm` linked; `SteamlessController` needs `comctl32`.
+See [`steamlesscontroller-patches/README.md`](../steamlesscontroller-patches/README.md) — apply
+the patch to SteamlessController 1.17 and build. Verified to apply and build on a pristine
+checkout.
 
 ## The probe
 

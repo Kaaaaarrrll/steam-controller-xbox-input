@@ -13,7 +13,14 @@ If you searched for any of these, you are in the right place:
 - Steam Controller only works when Steam is running
 - Steam Controller stuck in lizard mode (keyboard and mouse)
 - Steam Controller not detected by game
+- Steam keeps closing by itself / Steam quits on its own (see [Troubleshooting](#troubleshooting))
+- "Driver required" or "Xbox controller driver missing" after uninstalling Apollo, Sunshine or
+  DS4Windows — ViGEmBus was removed
+- Steam Controller **"..." / Quick Access button does nothing** on Windows
+- Steam Controller trackpad click turns into a **click and drag**
+- Play audio through the Steam Controller trackpads / audio haptics instead of rumble
 - `GAMEMODE: exclusive claim blocked - another process holds a write handle`
+- `GAMEMODE: ViGEm virtual controller failed (stage=vigem_connect, err=0xE0000001, driverMissing=1)`
 
 ---
 
@@ -53,13 +60,14 @@ automatically, at the process level:
 
 | Situation | Who owns the controller |
 |---|---|
-| Windows desktop, Xbox UI, browsing, launching anything | **Bridge** → virtual Xbox 360 pad |
+| Windows desktop, Xbox UI, Game Pass, anything outside a Steam game | **Bridge** → virtual Xbox 360 pad |
 | A Steam game is running | **Steam Input** (trackpads, gyro, back paddles, per-game configs) |
-| Steam game exits, you leave Steam in the background | 20 s later Steam quits, bridge takes over |
-| You open Big Picture deliberately | Steam keeps it, until idle in the background for 2 min |
+| The Steam game exits — Steam is left open | **Bridge** again. Steam is not touched. |
 
-Net effect: you stop thinking about it. The Xbox UI always responds to the pad, and Steam
-games still get the full Steam Input experience.
+**It never closes Steam.** Earlier versions did — 20 seconds after a game ended, or after two
+minutes of Steam simply sitting in the background — to get the controller back. From the
+outside that looks like Steam quitting at random, and it deleted Steam's autostart entry too.
+Both are gone. See [Troubleshooting](#troubleshooting) if an older version did this to you.
 
 ---
 
@@ -86,7 +94,8 @@ The installer will:
    not already present — this is the component that reads the pad's raw HID reports.
 2. Install **[ViGEmBus](https://github.com/nefarius/ViGEmBus)** if missing (winget first,
    GitHub release as fallback) — the virtual Xbox 360 pad driver.
-3. Remove Steam's and SteamlessController's own autostart entries; the watchdog owns startup.
+3. Remove SteamlessController's own autostart entry, so the scheduled task starts it elevated
+   instead. Steam's autostart is left alone.
 4. Detect your Steam path and the Xbox app's launch id, and write
    `%LOCALAPPDATA%\SteamPadBridge\config.json`.
 5. Register a logon scheduled task, **SteamPad Bridge Watchdog**, elevated, with a 15 s delay.
@@ -98,33 +107,36 @@ Uninstall with `-Uninstall`. Re-run with `-SkipInstall` to refresh config and th
 
 **1. SteamlessController mode (required).** Open its tray icon and set:
 
-- Mode: **"Off while Steam is running"**
+- Mode: **"Off ONLY while in Steam game"** (`AutoSteamMode = 2`)
 - Emulation type: **Xbox 360**
 - **Turn off** its own "Start with Windows" — the scheduled task starts it *elevated*, which
   matters, because a non-elevated bridge loses trackpad output to elevated windows.
 
 > Do **not** leave it on Manual and just tick "Enable Steamless Mode". That toggle is runtime
 > state and is **never written to the registry**, so the bridge comes up holding nothing after
-> every reboot and after every handoff back from Steam. `AutoSteamMode = 1`
-> ("Off while Steam is running") claims the pad automatically whenever Steam is absent.
+> every reboot and after every handoff back from Steam.
+>
+> Mode 2 rather than mode 1 ("Off while Steam is running") is what lets the controller come back
+> after a Steam game **without closing Steam**. On mode 1 the bridge stays off for as long as
+> Steam is open — which is why older versions of this watchdog closed Steam.
 
 **2. Steam button mapping.** In SteamlessController, check the Steam button emits the Xbox
 **Guide** button — that is what opens Game Bar and the Xbox home overlay.
 
-**3. Steam autostart.** Steam → Settings → Interface → untick *"Run Steam when my PC starts"*.
-Steam re-adds its own Run key when it exits, so the watchdog scrubs it every 5 minutes too,
-but turning the setting off is cleaner.
+**3. Steam autostart is yours to choose.** Older versions of this installer turned it off, and
+the watchdog kept deleting Steam's Run key every five minutes. Neither happens any more. If an
+old version switched it off for you: Steam → Settings → Interface → *"Run Steam when my PC
+starts"*.
 
 ### Optional: boot straight into Xbox mode
 
 Settings → Gaming → **Xbox mode** (called "Full screen experience" on older builds): set
 **Choose home app = Xbox** and turn on **Enter Xbox mode on startup**.
 
-Xbox mode should boot first and **Steam should not autostart**. The reverse would mean Steam
-owns the pad from boot, and every trip to the Xbox app would leave you with a dead controller.
 The Xbox app already aggregates Steam, Epic, GOG and Battle.net libraries, so launching a Steam
 game from the Xbox UI just starts Steam on demand — which is the handoff the watchdog is built
-around.
+around: Steam Input takes the controller for the game, and the bridge takes it back when you
+return.
 
 ## Verify it works
 
@@ -142,8 +154,9 @@ The state machine has its own test suite, which needs no controller, no Steam an
 powershell -ExecutionPolicy Bypass -File .\Test-WatchdogDecision.ps1
 ```
 
-32 checks covering the state machine, the startup path, the return-to-Xbox rules, process
-counting, the probe cache and config parsing.
+27 checks covering the state machine, the startup path, the return-to-Xbox rules, process
+counting, the probe cache and config parsing — including one that sweeps every combination of
+inputs and asserts that none can produce an action that closes Steam.
 
 ---
 
@@ -164,6 +177,8 @@ nothing until the bridge restarts (quit it from the tray; the watchdog brings it
 | Left trackpad | scroll wheel | `LeftPadMode = 2` |
 | Left trackpad click | right mouse button | `LeftPadClick = 13` |
 | Scroll direction | natural | `LeftPadScrollDir = 0` (`1` reverses) |
+| Steam button | Xbox **Guide** | fixed |
+| "..." (Quick Access) button | toggles the Windows touch keyboard | fixed — **patched build only**; stock ignores this button |
 
 Value meanings, decoded from the MIT source because none of it is documented:
 
@@ -214,66 +229,56 @@ Edit `%LOCALAPPDATA%\SteamPadBridge\config.json`, then restart the task.
 
 | Key | Default | What it does |
 |---|---|---|
-| `GraceAfterGameSeconds` | `20` | Delay after a game exits *and you have left Steam in the background* before Steam is shut down. While Big Picture is focused, Steam is never touched. |
-| `IdleBrowseSeconds` | `120` | Steam open, no game, not focused → quit. Set very high if you like leaving Steam open. |
-| `FocusXboxAfterSteam` | `true` | Relaunch/focus the Xbox app once Steam is gone. |
-| `ReturnToXboxAfterGame` | `true` | Also return to the Xbox app when a full screen app exits to the desktop. |
-| `CycleDeviceOnHandoff` | `false` | Last resort — power-cycles the dongle at handoff to force re-enumeration. |
-| `BridgeStartDelaySeconds` | `3` | Wait after Steam exits before grabbing the controller. Raise to 5–6 if handoffs are flaky. |
+| `ReturnToXboxAfterGame` | `true` | Return to the Xbox app when a full screen app exits to the desktop. |
+| `BridgeStartDelaySeconds` | `3` | Wait after a Steam game exits before starting the bridge. Raise to 5–6 if handoffs are flaky. |
 | `PollMilliseconds` | `500` | Loop speed. |
 
-Trackpad feel lives in the registry under `HKCU\Software\SteamlessController`, and applies only
-to the patched build described below:
+`GraceAfterGameSeconds`, `IdleBrowseSeconds`, `FocusXboxAfterSteam`, `CycleDeviceOnHandoff` and
+`KeepSteamAutostartOff` belonged to the Steam-closing behaviour and are gone. Left in an old
+`config.json` they are ignored.
+
+Trackpad feel lives in the registry under `HKCU\Software\SteamlessController`, applies only to
+the patched build described below, and is read **once at bridge startup**. The full list is in
+[`steamlesscontroller-patches/README.md`](steamlesscontroller-patches/README.md#settings); the
+ones worth knowing:
 
 | Value | Default | What it does |
 |---|---|---|
+| `PadPressArea` | `1400` | Contact area at which the pointer freezes for a click. Lower it if clicks still drag. |
 | `PadMomentumMs` | `300` | Coast time after a flick. `0` disables coasting. |
 | `XboxScrollDivisor` | `6` | Divides scroll while the Xbox app is in front. `1` restores stock. |
-| `XboxScrollWarpCursor` | `1` | Move the cursor onto content before scrolling in the Xbox app. |
-
-All three are read **once at bridge startup**.
 
 ---
 
 ## Optional: the patched SteamlessController build
 
-`steamlesscontroller-patches/` holds reference copies of three changes to
-[SteamlessController](https://github.com/ddeverill/SteamlessController), none of which are
-reachable from its settings. **They are optional** — everything above works on the stock binary.
+[`steamlesscontroller-patches/steamlesscontroller-1.17.patch`](steamlesscontroller-patches/)
+is one patch against [SteamlessController](https://github.com/ddeverill/SteamlessController)
+1.17. **It is optional** — everything above works on the stock binary. Verified to apply and
+build on a pristine 1.17 checkout. What it adds:
 
-- **Flick-to-coast on both pads.** Stock, pad movement stops dead the instant the finger lifts.
-  The patch estimates lift-off velocity and decays it exponentially after release.
+- **Audio haptics** — system audio streamed to the trackpad actuators, replacing rumble
+  (see [below](#audio-haptics)).
+- **The "..." (Quick Access) button toggles the Windows touch keyboard.** It is bit `0x10` of
+  report byte 2, which stock never decodes — so on stock the button does nothing at all.
+- **Trackpad clicks no longer turn into drags.** Pressing hard enough to click rolls the
+  fingertip; the pointer now freezes while the pad is being pressed, triggered by contact area,
+  which rises *before* the click registers.
+- **Flick-to-coast** on both pads, from a least-squares velocity fit rather than a two-sample
+  difference — which feels chaotic, because one unit of jitter over a 4 ms report gap is
+  250 units/s of noise.
+- **Whole-detent scrolling**, because the Xbox app's WinUI surfaces shiver on fractional wheel
+  deltas; plus **scroll scaling and cursor warp** for the Xbox app, where one notch is a whole
+  content row and the wheel goes to whatever is under the cursor.
+- **One settings window** with Controls and Audio Haptics tabs, and a **clearer popup** when
+  ViGEmBus goes missing.
 
-  The velocity estimate is the part that matters, and the obvious implementation does not work.
-  Differencing the last two reports and smoothing feels chaotic, because a report gap is ~4 ms:
-  one unit of capacitive jitter becomes 250 units/s of noise, and any smoothing quick enough to
-  stay responsive is dominated by it. So this follows what Android's `VelocityTracker` settled
-  on — keep a bounded history of finger *positions*, discard anything older than a 100 ms
-  horizon, and least-squares fit a 2nd-degree polynomial across the rest. The linear coefficient
-  at release is the velocity; the quadratic term is what makes an accelerating flick feel right.
-  Every touched report is sampled, moved or not, which is what makes "drag, pause, lift"
-  correctly produce no fling. `velocity_test.cpp` checks the fit against synthetic swipes.
+How to apply and build, every setting, and the reasoning behind each change:
+[`steamlesscontroller-patches/README.md`](steamlesscontroller-patches/README.md).
 
-- **Whole-detent scrolling.** Stock, scroll is emitted as sub-`WHEEL_DELTA` deltas at report
-  rate. Classic Win32 scroll bars accumulate those happily, but WinUI/UWP surfaces retarget a
-  smooth-scroll animation on every wheel message, so a stream of fractional deltas leaves the
-  view shivering in place without travelling. That is exactly what the Xbox full screen
-  experience does. A real wheel only sends whole notches; so does the patch.
-
-- **Xbox app scroll scaling and cursor warp.** One notch in the Xbox UI advances a whole content
-  row (~54% of the viewport), roughly 8× an ordinary window — hence `XboxScrollDivisor`. And
-  Windows delivers wheel events to the window under the **cursor**, not the focused one; the
-  Xbox UI is gamepad-driven, so the other pad can easily park the pointer on the nav rail or a
-  screen edge, which swallows the wheel entirely. Measured: six notches at (3439,0) scrolled
-  nothing, while six at screen centre moved more than a full screen. The patch recentres the
-  cursor once per gesture, only in that app, only when the cursor is somewhere useless.
-
-Build from the SteamlessController source with the VS 2026 C++ toolset
-(`cmake --preset release`, then `cmake --build build/release --config Release`) and copy the
-result over the installed binary, keeping the original as `SteamlessController.exe.stock`.
-
-> **A SteamlessController update silently overwrites the patch** and both behaviours revert to
-> stock. Nothing errors. Rebuild and copy back, or restore `.stock` deliberately.
+> **Based on SteamlessController 1.17.** Upstream is at 1.24 and rewrote many of the same
+> files, so the patch does not apply there yet. And **a SteamlessController update silently
+> overwrites the patched binary** — everything reverts to stock with no error.
 
 ---
 
@@ -287,20 +292,27 @@ the texture.
 That work, the HID protocol it uses, and two hardware findings that are not documented
 anywhere else - only one of five vendor interfaces drives the actuators, and a write costs
 4000 us because it waits for the radio slot - are in
-[`steamlesscontroller-patches/audio-haptics/`](steamlesscontroller-patches/audio-haptics/).
+[`docs/audio-haptics.md`](docs/audio-haptics.md). The code is part of the patch above.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
+| **Steam keeps closing by itself** | An older version of this watchdog did that on purpose — 20 s after a game ended, or after 2 min of Steam idle in the background. Re-run the installer to update it. If this was the cause, `%LOCALAPPDATA%\SteamPadBridge\logs\watchdog.log` has lines reading `Shutting Steam down (...)`. |
+| **Steam no longer starts with Windows** | Older versions deleted Steam's Run key, and kept deleting it. Turn it back on in Steam → Settings → Interface; it sticks now. |
+| **Popup: "Driver required" / "Xbox controller driver missing"** — and the Steam button, the "..." button and the paddles all stopped working | **ViGEmBus is gone** — most often removed by uninstalling an app that had installed it: Apollo, Sunshine, DS4Windows and others. SteamlessController's event log shows `vigem_connect ... driverMissing=1`. Reinstall **ViGEmBus 1.22.0** from [its releases](https://github.com/nefarius/ViGEmBus/releases/latest) (the final release; the project is retired). The bridge retries every 30 s and picks it up without a restart. Installed on its own, it no longer belongs to the other app. |
+| **Trackpad click turns into a click-and-drag** | Patched build: the pointer freezes while the pad is pressed. Still dragging? Lower `PadPressArea` (try `1100`) and restart the bridge. Stock SteamlessController has no protection against this. |
+| **The "..." button does nothing** | Stock SteamlessController never decodes it. The patched build maps it to the touch keyboard. |
+| **On-screen keyboard appears but its keys can't be clicked with the trackpad** | That is `osk.exe`, which runs at High integrity, so Windows discards injected clicks aimed at it. Use the **touch** keyboard instead — the "..." button in the patched build, or the Touch Keyboard binding. |
+| After a Steam game, the Xbox app gets no controller until Steam is closed | Check SteamlessController is on **"Off ONLY while in Steam game"** — mode 1 stays off for as long as Steam is open. If it already is, see [Known limitations](#known-limitations). |
 | Xbox UI ignores the pad at boot | Usually the dongle enumerated after the bridge started. Raise the task delay, or unplug/replug. `-SelfTest` will show `ControllerPresent: False`. |
-| Pad works, but the Xbox UI does nothing while Steam is open | Working as designed — Steam owns the pad. Quit Steam or wait out the idle timer. |
-| Steam game launches but Steam Input does not see the pad | The bridge released it a fraction too late. Press the Steam button, or set `CycleDeviceOnHandoff: true`. |
+| Pad works, but the Xbox UI does nothing while a Steam game runs | Working as designed — Steam Input owns the pad during a Steam game. It comes back when the game exits. |
+| Steam game launches but Steam Input does not see the pad | The bridge released it a fraction too late. Press the Steam button, or unplug and replug the dongle. |
 | Trackpad-as-mouse stops working over some windows | Elevation. Make sure the scheduled task is starting the bridge, not its own "Start with Windows". |
-| **Pad is dead after a reboot until you click the tray icon** | `AutoSteamMode` is back to `Manual` (0). The tray's "Enable Steamless Mode" tick is runtime-only and is never persisted. Set it to `1`. |
+| **Pad is dead after a reboot until you click the tray icon** | `AutoSteamMode` is back to `Manual` (0). The tray's "Enable Steamless Mode" tick is runtime-only and is never persisted. Set it to `2`. |
 | Scrolling does nothing in the Xbox app | Almost certainly the cursor, not the scroll — see the cursor-warp note above. |
 | Scrolling in the Xbox app flies down the page | One notch there is a whole content row. Raise `XboxScrollDivisor`. |
-| Momentum / whole-detent scroll / Xbox scroll fixes all stop at once | A SteamlessController update overwrote the patched binary. Rebuild and copy back. |
+| Every patched feature stops at once — haptics, the "..." button, momentum, scroll fixes | A SteamlessController update overwrote the patched binary. Rebuild and copy back. |
 | Everything is dead | The pad falls back to lizard mode: the right trackpad is a mouse, so you can always click your way out. Nothing here can strand you without input. |
 | A firmware update breaks the bridge | It has happened once (SteamlessController #40). Update SteamlessController before assuming this setup is at fault. |
 
@@ -315,10 +327,14 @@ anywhere else - only one of five vendor interfaces drives the actuators, and a w
 - This depends on a third-party tool. It is MIT-licensed and actively developed; if it ever
   stops being maintained, the SDL driver source documents the protocol well enough to rebuild
   the bridge.
-- SteamlessController v1.17's own "auto mode" sounds like it replaces this watchdog. It does
-  not: [issue #79](https://github.com/ddeverill/SteamlessController/issues/79) is that auto mode
-  can never take the controller while Steam holds it, which is precisely the case the watchdog
-  exists for. Arbitrating at the process level is still the only thing that works.
+- **Not yet verified on hardware: the controller returning to the bridge while Steam is still
+  open.** The watchdog now steps aside only while a Steam *game* runs, and leaves the rest to
+  SteamlessController's own "Off ONLY while in Steam game" mode. Whether SteamlessController can
+  take the device while an idle Steam still holds it depends on Steam's own controller handling,
+  and [issue #79](https://github.com/ddeverill/SteamlessController/issues/79) suggests it may
+  not. The watchdog's side is covered by its tests; this part is not. If the Xbox app gets no
+  controller after a Steam game until you close Steam, that is this — please open an issue and
+  attach `%LOCALAPPDATA%\SteamlessController\events.log`.
 
 ## Credits and licence
 
@@ -327,8 +343,8 @@ This repository is MIT-licensed — see [LICENSE](LICENSE).
 It installs and configures, but does not include, these projects:
 
 - **[SteamlessController](https://github.com/ddeverill/SteamlessController)** by ddeverill (MIT)
-  — reads the controller's raw HID reports. The files in `steamlesscontroller-patches/` are
-  derivative works of that project and remain under its MIT licence.
+  — reads the controller's raw HID reports. The patch in `steamlesscontroller-patches/` is a
+  derivative work of that project and remains under its MIT licence.
 - **[ViGEmBus](https://github.com/nefarius/ViGEmBus)** by Nefarius — the virtual pad driver.
 
 Not affiliated with Valve, Microsoft or AMD. "Steam" and "Xbox" are trademarks of their
@@ -339,7 +355,10 @@ respective owners.
 Issues and pull requests welcome. Particularly useful:
 
 - Testing on other Windows builds and Steam Controller firmware revisions
-- Upstreaming the trackpad patches into SteamlessController itself
+- Hardware reports on the one unverified case — the controller coming back to the bridge while
+  Steam is still open (see [Known limitations](#known-limitations))
+- Porting the patch to current SteamlessController (1.24), and upstreaming the parts that
+  belong there — decoding the "..." button is a small, self-contained start
 - Handoff edge cases the watchdog gets wrong — attach
   `%LOCALAPPDATA%\SteamPadBridge\logs\watchdog.log`
 
@@ -348,4 +367,8 @@ Issues and pull requests welcome. Particularly useful:
 Steam Controller 2026 XInput · Steam Controller Xbox app · Steam Controller Game Pass ·
 Steam Controller without Steam · Steam Controller lizard mode fix · Steam Controller ViGEmBus ·
 Steam Controller virtual Xbox 360 controller · SteamlessController watchdog ·
-Steam Controller Xbox full screen experience · Steam exclusive claim controller
+Steam Controller Xbox full screen experience · Steam exclusive claim controller ·
+Steam closes by itself · ViGEmBus removed after uninstalling Apollo · ViGEmBus uninstalled by
+Sunshine · Steam Controller Quick Access button Windows · Steam Controller ellipsis button ·
+Steam Controller touch keyboard · Steam Controller trackpad click drag · Steam Controller haptics
+audio · Steam Controller play music through haptics · Steam Controller PCM haptics

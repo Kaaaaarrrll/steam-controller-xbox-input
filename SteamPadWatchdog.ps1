@@ -15,10 +15,17 @@
         This watchdog enforces that, and flips between them automatically.
 
     State machine (polled twice a second):
-        Steam not running  ->  bridge should be running
-        Steam running      ->  bridge must be stopped (Steam owns the pad)
-        Steam running, no game for GraceAfterGameSeconds -> shut Steam down,
-                                                            bring back bridge
+        No Steam game running  ->  bridge should be running
+        Steam game running     ->  bridge stops (Steam Input owns the pad)
+
+    Steam merely being OPEN is not a reason to stop. That is the "finished a
+    game, back in the Xbox app" case, and the bridge is the only thing making
+    the pad work there. Matches the app's own "Auto - Off ONLY while in Steam
+    game" mode, which this used to override by killing the process under it.
+
+    It never closes Steam. It used to, once Steam had been in the background
+    for a while, and that reads from the outside as Steam quitting itself at
+    random. Starting and stopping Steam is the user's business.
 
     Runs unattended from a logon scheduled task. Logs to
     %LOCALAPPDATA%\SteamPadBridge\logs\watchdog.log
@@ -40,13 +47,8 @@ $Defaults = [ordered]@{
     XboxAumid               = ''      # e.g. Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App
     ControllerVid           = 'VID_28DE'
     PollMilliseconds        = 500
-    GraceAfterGameSeconds   = 20      # game exited -> wait this long -> quit Steam
-    IdleBrowseSeconds       = 120     # Steam open, never launched a game, not focused -> quit
     BridgeStartDelaySeconds = 3       # let Steam fully release the HID handle first
-    FocusXboxAfterSteam     = $true   # bring the Xbox app forward once Steam quits
-    ReturnToXboxAfterGame   = $true   # ...and when a full screen game exits to the desktop
-    CycleDeviceOnHandoff    = $false  # last-resort: disable/enable the dongle on handoff
-    KeepSteamAutostartOff   = $true   # scrub Steam's Run key if it reappears
+    ReturnToXboxAfterGame   = $true   # bring the Xbox app back when a full screen game exits to the desktop
     LogLevel                = 'info'  # info | debug
 }
 
@@ -291,48 +293,6 @@ function Start-Bridge {
     }
 }
 
-function Invoke-DeviceCycle {
-    if (-not $Config.CycleDeviceOnHandoff) { return }
-    try {
-        $devs = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like "*$($Config.ControllerVid)*" }
-        foreach ($d in $devs) {
-            Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 600
-            Enable-PnpDevice  -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-        }
-        Write-Log "Cycled controller device(s) to force re-enumeration."
-    } catch {
-        Write-Log "Device cycle failed: $($_.Exception.Message)" 'warn'
-    }
-}
-
-function Stop-Steam {
-    param([string] $Reason)
-    $steam = Get-SteamProcess
-    if (-not $steam) { return }
-    Write-Log "Shutting Steam down ($Reason)."
-    $exe = $Config.SteamExe
-    if ([string]::IsNullOrWhiteSpace($exe) -or -not (Test-Path -LiteralPath $exe)) {
-        try { $exe = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -Name SteamExe -ErrorAction Stop).SteamExe } catch { $exe = '' }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($exe)) {
-        try { Start-Process -FilePath $exe -ArgumentList '-shutdown' | Out-Null } catch {
-            Write-Log "steam -shutdown failed: $($_.Exception.Message)" 'warn'
-        }
-    }
-    $deadline = (Get-Date).AddSeconds(25)
-    while ((Get-SteamProcess) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-    if (Get-SteamProcess) {
-        Write-Log "Steam did not exit cleanly; forcing." 'warn'
-        Get-SteamProcess | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-    }
-    Start-Sleep -Seconds ([int]$Config.BridgeStartDelaySeconds)
-    Invoke-DeviceCycle
-    Start-Bridge
-    if ($Config.FocusXboxAfterSteam) { Show-XboxApp -Reason 'Steam quit' }
-}
-
 function Show-XboxApp {
     param([string] $Reason)
     if ([string]::IsNullOrWhiteSpace($Config.XboxAumid)) { return }
@@ -342,17 +302,6 @@ function Show-XboxApp {
     } catch {
         Write-Log "Could not relaunch the Xbox app: $($_.Exception.Message)" 'warn'
     }
-}
-
-function Remove-SteamAutostart {
-    if (-not $Config.KeepSteamAutostartOff) { return }
-    try {
-        $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-        if ((Get-Item $run).GetValue('Steam', $null)) {
-            Remove-ItemProperty -Path $run -Name 'Steam' -ErrorAction SilentlyContinue
-            Write-Log "Removed Steam's autostart entry (it re-adds itself on exit)."
-        }
-    } catch { }
 }
 
 # ------------------------------------------------------------------ self test
@@ -386,31 +335,23 @@ function Get-WatchdogDecision {
         [bool] $SteamRunning,
         [bool] $GameRunning,
         [bool] $BridgeRunning,
-        [bool] $SteamForeground,
-        [bool] $ControllerPresent,
-        [bool] $HadGame,
-        [double] $NoGameSeconds,
-        [int] $GraceAfterGameSeconds = 20,
-        [int] $IdleBrowseSeconds = 120
+        [bool] $ControllerPresent
     )
 
-    if ($SteamRunning) {
-        # Steam and the bridge cannot share the controller: Steam takes an
-        # exclusive claim, and the bridge fights it (SteamlessController #79/#80).
+    # A Steam GAME owns the controller: Steam Input claims it exclusively and the
+    # bridge would fight it (SteamlessController #79/#80). Steam merely being OPEN
+    # does not - and that case matters, because it is the one where you have
+    # finished a game and gone back to the Xbox app, where the bridge is the only
+    # thing making the pad work at all.
+    #
+    # This used to stop the bridge whenever steam.exe existed, which silently
+    # overrode the app's own "Auto - Off ONLY while in Steam game" mode: the mode
+    # would release the pad correctly and the watchdog would kill the process
+    # underneath it, so the pad never came back until Steam was closed. Closing
+    # Steam was then bolted on to compensate. Both halves are gone now.
+    if ($GameRunning) {
         if ($BridgeRunning) {
-            return [pscustomobject]@{ Action = 'StopBridge'; Reason = 'Steam is running and owns the controller' }
-        }
-        # Never pull Steam out from under someone who is looking at it. When a
-        # game exits, Big Picture comes back to the foreground - and that is
-        # exactly where you pick the next game. So the timers only start once
-        # Steam has actually been left in the background.
-        if (-not $GameRunning -and -not $SteamForeground) {
-            if ($HadGame -and $NoGameSeconds -ge $GraceAfterGameSeconds) {
-                return [pscustomobject]@{ Action = 'StopSteam'; Reason = 'game exited' }
-            }
-            if (-not $HadGame -and $NoGameSeconds -ge $IdleBrowseSeconds) {
-                return [pscustomobject]@{ Action = 'StopSteam'; Reason = 'Steam idle in the background' }
-            }
+            return [pscustomobject]@{ Action = 'StopBridge'; Reason = 'a Steam game is running and owns the controller' }
         }
         return [pscustomobject]@{ Action = 'None'; Reason = 'Steam Input is driving the pad' }
     }
@@ -419,7 +360,9 @@ function Get-WatchdogDecision {
         if (-not $ControllerPresent) {
             return [pscustomobject]@{ Action = 'None'; Reason = 'waiting for the controller to appear' }
         }
-        return [pscustomobject]@{ Action = 'StartBridge'; Reason = 'no Steam - the bridge should own the pad' }
+        $why = if ($SteamRunning) { 'Steam is open but no game - the bridge owns the pad' }
+               else                { 'no Steam - the bridge should own the pad' }
+        return [pscustomobject]@{ Action = 'StartBridge'; Reason = $why }
     }
 
     return [pscustomobject]@{ Action = 'None'; Reason = 'bridge is driving the pad' }
@@ -447,14 +390,15 @@ function Get-XboxReturnDecision {
 }
 
 # Pure: what to do about a Steam process that is already up when we start.
-# At logon that is leftover cruft. But the scheduled task also restarts this
-# script after a crash (RestartCount 5), and mid-session Steam may be hosting a
-# live game - force-quitting it there would kill the game under the player.
+# Steam already running simply means the bridge waits. This used to close it,
+# on the reasoning that leftover Steam at logon was cruft - but the scheduled
+# task also restarts this script after a crash, so "at logon" was never a safe
+# assumption, and closing someone's Steam is not ours to do either way.
 function Get-StartupAction {
     param([bool] $SteamRunning, [bool] $GameRunning)
     if (-not $SteamRunning) { return 'None' }
     if ($GameRunning)       { return 'AdoptGame' }
-    return 'StopSteam'
+    return 'None'
 }
 
 # Loaded by the test harness: define everything, then stop before the loop.
@@ -462,7 +406,6 @@ if ($env:STEAMPAD_TEST_MODE -eq '1') { return }
 
 # ----------------------------------------------------------------- main loop
 Write-Log "Watchdog started. bridge='$($Config.BridgeExe)' steam='$($Config.SteamExe)'"
-Remove-SteamAutostart
 
 $hadGame        = $false
 $noGameSince    = $null
@@ -481,7 +424,6 @@ switch (Get-StartupAction -SteamRunning $steamAtStart -GameRunning $gameAtStart)
         $hadGame       = $true
         $lastSteamSeen = $true
     }
-    'StopSteam' { Stop-Steam -Reason 'leftover Steam at logon' }
 }
 
 while ($true) {
@@ -541,30 +483,15 @@ while ($true) {
             -SteamRunning $steamRunning `
             -GameRunning $gameRunning `
             -BridgeRunning $bridgeRunning `
-            -SteamForeground (@('steam','steamwebhelper') -contains (Get-ForegroundProcessName)) `
-            -ControllerPresent $controllerPresent `
-            -HadGame $hadGame `
-            -NoGameSeconds $noGameSeconds `
-            -GraceAfterGameSeconds ([int]$Config.GraceAfterGameSeconds) `
-            -IdleBrowseSeconds ([int]$Config.IdleBrowseSeconds)
+            -ControllerPresent $controllerPresent
 
         switch ($decision.Action) {
             'StopBridge'  { Stop-Bridge }
             'StartBridge' { Start-Bridge }
-            'StopSteam'   {
-                Stop-Steam -Reason $decision.Reason
-                $hadGame = $false
-                $noGameSince = $null
-            }
             default { Write-Log $decision.Reason 'debug' }
         }
 
         $lastSteamSeen = $steamRunning
-
-        if (((Get-Date) - $lastScrub).TotalMinutes -ge 5) {
-            Remove-SteamAutostart
-            $lastScrub = Get-Date
-        }
     } catch {
         Write-Log "Loop error: $($_.Exception.Message)" 'error'
         Start-Sleep -Seconds 2

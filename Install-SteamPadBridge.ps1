@@ -8,7 +8,8 @@
     What it does
       1. Installs ViGEmBus (virtual Xbox 360 pad driver) if missing.
       2. Installs SteamlessController (raw Steam Controller HID -> virtual pad).
-      3. Turns OFF Steam's autostart and SteamlessController's own autostart.
+      3. Turns off SteamlessController's own autostart, so the scheduled task
+         starts it elevated instead. Steam's autostart is left alone.
       4. Discovers your Steam and Xbox app paths, writes config.json.
       5. Registers a logon scheduled task that runs SteamPadWatchdog.ps1
          elevated, which arbitrates the controller between the bridge and Steam.
@@ -18,7 +19,7 @@
 
     Options:
         -SkipInstall   configure only; do not download/install anything
-        -Uninstall     remove the scheduled task + config (Steam autostart stays off)
+        -Uninstall     remove the scheduled task + config
 #>
 
 [CmdletBinding()]
@@ -71,7 +72,7 @@ if ($Uninstall) {
         Rename-Item $AppDir "$AppDir.removed-$(Get-Date -Format yyyyMMddHHmmss)" -ErrorAction SilentlyContinue
         Good 'Config and logs archived.'
     }
-    Say 'Steam autostart was left off. Re-enable it in Steam > Settings > Interface if you want it back.'
+    Say 'If an older version of this installer turned Steam''s autostart off, re-enable it in Steam > Settings > Interface.'
     Say 'SteamlessController and ViGEmBus are still installed; remove them from Apps & features if you no longer want them.'
     return
 }
@@ -234,17 +235,19 @@ if (-not $BridgeExe) { $BridgeExe = Find-BridgeExe }
 if (-not $BridgeExe) { Bad 'SteamlessController.exe could not be located - the watchdog will not be able to start it.' }
 
 # ------------------------------------------------------------------- autostart
-Step 'Autostart hygiene (only one thing may own the controller at a time)'
+Step 'Autostart (the scheduled task starts the bridge, elevated)'
+# Only SteamlessController's own entry. Steam's used to be removed here too, and
+# a running watchdog kept scrubbing it - so Steam silently stopped starting with
+# Windows. Whether Steam starts at logon is the user's decision, not ours.
 $runKeyObj = Get-Item $RunKey -ErrorAction SilentlyContinue
-foreach ($name in @('Steam','SteamlessController','Steamless Controller')) {
+foreach ($name in @('SteamlessController','Steamless Controller')) {
     if ($runKeyObj -and $null -ne $runKeyObj.GetValue($name, $null)) {
         Remove-ItemProperty -Path $RunKey -Name $name -ErrorAction SilentlyContinue
-        Good "Removed '$name' from HKCU Run (the watchdog owns startup now)."
+        Good "Removed '$name' from HKCU Run (the scheduled task starts it elevated instead)."
     }
 }
-Say "Also untick Steam > Settings > Interface > 'Run Steam when my PC starts' - Steam re-adds itself otherwise."
-Say "And untick 'Start with Windows' inside SteamlessController, so it starts elevated from the task instead."
-Say "Set its mode to 'Off while Steam is running' - the manual toggle is runtime-only and never persisted."
+Say "Untick 'Start with Windows' inside SteamlessController, so it starts elevated from the task instead."
+Say "Set its mode to 'Off ONLY while in Steam game' - the manual toggle is runtime-only and never persisted."
 
 # --------------------------------------------------------------------- config
 Step 'Writing configuration'
@@ -265,13 +268,8 @@ $config = [ordered]@{
     XboxAumid               = $XboxAumid
     ControllerVid           = 'VID_28DE'
     PollMilliseconds        = 500
-    GraceAfterGameSeconds   = 20
-    IdleBrowseSeconds       = 120
     BridgeStartDelaySeconds = 3
-    FocusXboxAfterSteam     = $true
     ReturnToXboxAfterGame   = $true
-    CycleDeviceOnHandoff    = $false
-    KeepSteamAutostartOff   = $true
     LogLevel                = 'info'
 }
 # UTF-8 *without* BOM - PowerShell 5.1's ConvertFrom-Json trips over a BOM,
